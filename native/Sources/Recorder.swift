@@ -36,16 +36,19 @@ final class Recorder: NSObject, SCRecordingOutputDelegate {
   private var outURL: URL?
 
   // region 为 CG 坐标（点，左上原点）；nil = 整屏
-  // excluding：要从画面里剔除的窗口（录制状态条等 UI），按 windowNumber 匹配
+  // excluding：要从画面里剔除的窗口（录制状态条等 UI），传 windowNumber
   //
   // async 版本：曾经用信号量在调用线程上同步等 SCShareableContent 查询和
   // startCapture，而调用方是 @MainActor 的 Model.start——查询期间整个 UI
   // 冻结、状态条渲染被推迟，还连锁推迟了对焦快照的 Task（要等主线程空出来），
   // Glass 提示音因此比实际开录晚约半秒。现在 await 让主线程立即返回。
-  func start(region: CGRect?, to url: URL, excluding excluded: [NSWindow] = []) async throws {
+  func start(region: CGRect?, to url: URL, excluding excludedWindowIDs: [Int] = []) async throws {
     let content: SCShareableContent
     do {
-      content = try await Self.withTimeout(seconds: 10) {
+      // 首次运行时这个查询会挂着系统授权弹窗等用户决定：人在读弹窗、读选项，
+      // 10 秒根本不够——而超时不是权限错误，needsPermission 不会置位，引导
+      // 路径自己绊自己。所以查询放宽到 60 秒，10 秒只留给 startCapture。
+      content = try await Self.withTimeout(seconds: 60) {
         try await SCShareableContent.current
       }
     } catch {
@@ -91,10 +94,10 @@ final class Recorder: NSObject, SCRecordingOutputDelegate {
     // 全屏录制时状态条在画面内，必须从采集里剔除；
     // 框选时状态条在选区外本来就不入镜，剔除只是双保险。
     let excludedSC = allWindows.filter { sc in
-      excluded.contains { $0.windowNumber == sc.windowID }
+      excludedWindowIDs.contains(Int(sc.windowID))
     }
-    if excludedSC.count < excluded.count {
-      dbg("warning: \(excluded.count - excludedSC.count) 个 overlay 窗口没匹配到 SCWindow，可能被录进成片")
+    if excludedSC.count < excludedWindowIDs.count {
+      dbg("warning: \(excludedWindowIDs.count - excludedSC.count) 个 overlay 窗口没匹配到 SCWindow，可能被录进成片")
     }
     let filter = SCContentFilter(display: display, excludingWindows: excludedSC)
     let stream = SCStream(filter: filter, configuration: config, delegate: nil)

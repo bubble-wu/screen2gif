@@ -15,6 +15,8 @@ final class Model: ObservableObject {
   @Published var needsPermission = false
   /// 启动自检出缺失的依赖（node/ffmpeg/ffprobe），菜单里给一键安装
   @Published var missingDeps: [String] = []
+  /// 「安装依赖」进行中：隐藏按钮 + 拦住重复点击（连点会起两个 brew）
+  @Published private(set) var installing = false
 
   private let recorder = Recorder()
   // 圈选已经表达了取景意图，转码时跳过 auto 裁剪，所见即所得
@@ -55,10 +57,10 @@ final class Model: ObservableObject {
     missingDeps = Deps.missing()
   }
 
-  /// 菜单里的「安装缺失依赖」：跑 brew install（进度输出吞掉，只看结果），
+  /// 菜单里的「安装缺失依赖」：跑 brew install（进度不透传，只留报错尾巴），
   /// 装完重查，成功与否都更新菜单状态
   func installDeps() {
-    guard !missingDeps.isEmpty else { return }
+    guard !installing, !missingDeps.isEmpty else { return }
     guard let brew = Deps.brewURL else {
       statusLine = "未找到 Homebrew，请先到 brew.sh 安装"
       if let url = URL(string: "https://brew.sh") { NSWorkspace.shared.open(url) }
@@ -66,6 +68,7 @@ final class Model: ObservableObject {
     }
     // ffprobe 随 ffmpeg 一起装
     let specs = Array(Set(missingDeps.map { $0 == "ffprobe" ? "ffmpeg" : $0 })).sorted()
+    installing = true
     statusLine = "安装依赖中（可能需要几分钟）…"
     let process = Process()
     process.executableURL = brew
@@ -73,31 +76,37 @@ final class Model: ObservableObject {
     var env = ProcessInfo.processInfo.environment
     env["PATH"] = Converter.searchPATH()
     process.environment = env
-    // brew 的进度写在 stderr，量不大，退出后读尾巴用于报错
+    // brew 的进度写在 stderr，量可能很大：stdout 直接丢弃；stderr 不能等退出后
+    // 才读——输出超过管道缓冲（64KB）会把 brew 永久卡死，必须边跑边排空。
+    process.standardOutput = FileHandle.nullDevice
     let errPipe = Pipe()
+    let tail = OutputTail()
     process.standardError = errPipe
-    process.standardOutput = Pipe()
+    do { try process.run() }
+    catch {
+      installing = false
+      statusLine = "无法启动 brew：\(error.localizedDescription)"
+      return
+    }
+    errPipe.fileHandleForReading.readabilityHandler = { fh in
+      let chunk = fh.availableData
+      if chunk.isEmpty { fh.readabilityHandler = nil } else { tail.append(chunk) }
+    }
     process.terminationHandler = { [weak self] proc in
       DispatchQueue.main.async {
         guard let self else { return }
+        self.installing = false
         self.missingDeps = Deps.missing()
         if proc.terminationStatus == 0 && self.missingDeps.isEmpty {
           self.statusLine = "依赖已就绪"
         } else {
-          let text = String(
-            data: errPipe.fileHandleForReading.readDataToEndOfFile(),
-            encoding: .utf8) ?? ""
-          let tail = text.split(separator: "\n")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .last(where: { !$0.isEmpty }) ?? "exit \(proc.terminationStatus)"
+          let text = tail.lastMessage() ?? "exit \(proc.terminationStatus)"
           self.statusLine = self.missingDeps.isEmpty
-            ? "安装失败：\(tail)"
-            : "部分依赖仍缺失（\(self.missingDeps.joined(separator: " "))）：\(tail)"
+            ? "安装失败：\(text)"
+            : "部分依赖仍缺失（\(self.missingDeps.joined(separator: " "))）：\(text)"
         }
       }
     }
-    do { try process.run() }
-    catch { statusLine = "无法启动 brew：\(error.localizedDescription)" }
   }
 
   func startFullscreen() {
@@ -146,7 +155,10 @@ final class Model: ObservableObject {
     statusLine = ""
     Task { @MainActor in
       do {
-        try await recorder.start(region: region, to: mov, excluding: overlayWindows)
+        // windowNumber 在 MainActor 上取好再传进去：Recorder.start 是 nonisolated
+        // async，直接摸 NSWindow 会撞并发检查
+        let excludedIDs = overlayWindows.map(\.windowNumber)
+        try await recorder.start(region: region, to: mov, excluding: excludedIDs)
         regionPicked = (region != nil)
         phase = .recording
         needsPermission = false
@@ -230,7 +242,7 @@ struct MenuContent: View {
       if model.needsPermission {
         Button("打开屏幕录制设置…") { model.openScreenCaptureSettings() }
       }
-      if !model.missingDeps.isEmpty {
+      if !model.missingDeps.isEmpty && !model.installing {
         Button("安装缺失依赖（\(model.missingDeps.sorted().joined(separator: " "))）…") {
           model.installDeps()
         }
@@ -255,6 +267,25 @@ struct MenuContent: View {
     case .converting:
       Text(model.statusLine)
     }
+  }
+}
+
+/// installDeps 的 brew stderr 收集器：在 readabilityHandler 的后台队列上追加，
+/// 锁保护跨线程读写；只在退出后取最后一条非空行用于报错（brew 把错误写在末尾）。
+final class OutputTail: @unchecked Sendable {
+  private let lock = NSLock()
+  private var text = ""
+
+  func append(_ data: Data) {
+    guard let chunk = String(data: data, encoding: .utf8) else { return }
+    lock.lock(); text += chunk; lock.unlock()
+  }
+
+  func lastMessage() -> String? {
+    lock.lock(); defer { lock.unlock() }
+    return text.split(separator: "\n")
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .last(where: { !$0.isEmpty })
   }
 }
 
