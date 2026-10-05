@@ -1,3 +1,4 @@
+import ScreenCaptureKit
 import SwiftUI
 
 // GUI 启动时 stderr 落到 /dev/null；从终端直接跑 app 二进制就能看到，用于调试。
@@ -12,6 +13,8 @@ final class Model: ObservableObject {
   @Published var phase: Phase = .idle
   @Published var statusLine = ""
   @Published var needsPermission = false
+  /// 启动自检出缺失的依赖（node/ffmpeg/ffprobe），菜单里给一键安装
+  @Published var missingDeps: [String] = []
 
   private let recorder = Recorder()
   // 圈选已经表达了取景意图，转码时跳过 auto 裁剪，所见即所得
@@ -37,6 +40,64 @@ final class Model: ObservableObject {
         }
       }
     }
+
+    // 启动即自检：权限/依赖的问题当场暴露在菜单里，
+    // 别让用户第一次录制失败才知道还要授权、装依赖
+    Task { @MainActor in
+      do { _ = try await SCShareableContent.current }
+      catch {
+        if Self.isPermissionError(error) {
+          needsPermission = true
+          statusLine = "缺少屏幕录制权限"
+        }
+      }
+    }
+    missingDeps = Deps.missing()
+  }
+
+  /// 菜单里的「安装缺失依赖」：跑 brew install（进度输出吞掉，只看结果），
+  /// 装完重查，成功与否都更新菜单状态
+  func installDeps() {
+    guard !missingDeps.isEmpty else { return }
+    guard let brew = Deps.brewURL else {
+      statusLine = "未找到 Homebrew，请先到 brew.sh 安装"
+      if let url = URL(string: "https://brew.sh") { NSWorkspace.shared.open(url) }
+      return
+    }
+    // ffprobe 随 ffmpeg 一起装
+    let specs = Array(Set(missingDeps.map { $0 == "ffprobe" ? "ffmpeg" : $0 })).sorted()
+    statusLine = "安装依赖中（可能需要几分钟）…"
+    let process = Process()
+    process.executableURL = brew
+    process.arguments = ["install"] + specs
+    var env = ProcessInfo.processInfo.environment
+    env["PATH"] = Converter.searchPATH()
+    process.environment = env
+    // brew 的进度写在 stderr，量不大，退出后读尾巴用于报错
+    let errPipe = Pipe()
+    process.standardError = errPipe
+    process.standardOutput = Pipe()
+    process.terminationHandler = { [weak self] proc in
+      DispatchQueue.main.async {
+        guard let self else { return }
+        self.missingDeps = Deps.missing()
+        if proc.terminationStatus == 0 && self.missingDeps.isEmpty {
+          self.statusLine = "依赖已就绪"
+        } else {
+          let text = String(
+            data: errPipe.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8) ?? ""
+          let tail = text.split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .last(where: { !$0.isEmpty }) ?? "exit \(proc.terminationStatus)"
+          self.statusLine = self.missingDeps.isEmpty
+            ? "安装失败：\(tail)"
+            : "部分依赖仍缺失（\(self.missingDeps.joined(separator: " "))）：\(tail)"
+        }
+      }
+    }
+    do { try process.run() }
+    catch { statusLine = "无法启动 brew：\(error.localizedDescription)" }
   }
 
   func startFullscreen() {
@@ -168,6 +229,11 @@ struct MenuContent: View {
       Text(model.statusLine.isEmpty ? "screen2gif" : model.statusLine)
       if model.needsPermission {
         Button("打开屏幕录制设置…") { model.openScreenCaptureSettings() }
+      }
+      if !model.missingDeps.isEmpty {
+        Button("安装缺失依赖（\(model.missingDeps.sorted().joined(separator: " "))）…") {
+          model.installDeps()
+        }
       }
       if !shortcuts.conflicts.isEmpty {
         Text("⚠ 有快捷键注册失败（可能被其他应用占用），可在「快捷键设置…」更换")

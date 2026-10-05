@@ -116,3 +116,31 @@ enum Converter {
     name.split(separator: ".").map { Int($0.filter(\.isNumber)) ?? 0 }
   }
 }
+
+
+// 依赖就位检查 + Homebrew 一键安装：GUI 侧对应 CLI 的 lib/deps.mjs。
+// 启动时查一次，缺了直接在菜单里给「安装缺失依赖」按钮，
+// 用户不用知道 ffmpeg/node/brew 是什么。
+enum Deps {
+  /// 缺失的依赖名（node / ffmpeg / ffprobe）
+  static func missing() -> [String] {
+    let dirs = Converter.searchPATH().split(separator: ":").map(String.init)
+    func find(_ name: String) -> Bool {
+      dirs.contains { FileManager.default.isExecutableFile(atPath: $0 + "/" + name) }
+    }
+    var result: [String] = []
+    if !find("node") { result.append("node") }
+    if !find("ffmpeg") { result.append("ffmpeg") }
+    if !find("ffprobe") { result.append("ffprobe") }
+    return result
+  }
+
+  static var brewURL: URL? {
+    for path in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"] {
+      if FileManager.default.isExecutableFile(atPath: path) {
+        return URL(fileURLWithPath: path)
+      }
+    }
+    return nil
+  }
+}

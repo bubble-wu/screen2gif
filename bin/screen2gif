@@ -1,4 +1,6 @@
-#!/usr/bin/env node
+#!/bin/sh
+':' //; command -v node >/dev/null 2>&1 || { echo '✗ 需要 Node.js >= 18。安装：brew install node' >&2; exit 127; }
+':' //; exec node "$0" "$@"
 import { mkdtemp, rm, readdir, stat, copyFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, basename, dirname } from 'node:path';
@@ -7,8 +9,9 @@ import {
   applyFrameCap, computeDelays, buildConcatList, encodeGif, SENSITIVITY,
 } from '../lib/video.mjs';
 import { record, frontWindowRegion, checkPermission } from '../lib/record.mjs';
+import { ensureFfmpeg, binWorks, responsibleAppName, openScreenCaptureSettings } from '../lib/deps.mjs';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 
 const HELP = `screen2gif ${VERSION} — 录屏 → 关键帧 → 裁剪 → GIF
 
@@ -306,6 +309,9 @@ async function main() {
   } else if (opts.input) {
     fail('record 不接受输入文件；要转已有视频请用 convert <文件>');
   }
+
+  // 依赖先行：缺 ffmpeg 时在录屏前就询问安装，别让用户等录完才发现转不了
+  await ensureFfmpeg();
 
   opts.out = resolve(opts.out || defaultOut());
   await mkdir(dirname(opts.out), { recursive: true });

@@ -9,9 +9,9 @@
 ## 依赖
 
 - macOS（用系统自带 `screencapture` 录屏）
-- ffmpeg / ffprobe：`brew install ffmpeg`
-- Node.js ≥ 18（仅用标准库，无 npm 依赖）
-- 「屏幕录制」权限：系统设置 → 隐私与安全性 → 屏幕录制，勾选运行命令的终端 / Qoder
+- Node.js ≥ 18（仅用标准库，无 npm 依赖；没装时运行 CLI 会直接提示 `brew install node`）
+- ffmpeg / ffprobe：**不需要提前装**——第一次运行 `record` / `convert` 检测到缺失时，会询问是否现在通过 Homebrew 自动安装（非交互环境给出手动安装命令）
+- 「屏幕录制」权限：macOS 把权限授给**运行命令的终端 app**（Terminal / iTerm / Qoder 各自独立，换终端要重新授权）。缺权限时录屏是 0 字节——CLI 会自动打开系统设置的授权面板，并指名该勾选哪个 app
 
 ## 安装
 
@@ -108,7 +108,7 @@ cd native && ./build.sh && open build/screen2gif.app
 
 已知限制：框选 overlay、状态条、角标都画在主屏；多显示器下只能在主屏框选（全屏录制也默认主屏），副屏内容不会入镜。
 
-注意：屏幕录制权限归属这个 .app，而且系统不会主动弹授权框（菜单栏 agent + 本地签名），必须手动加一次：系统设置 → 隐私与安全性 → 屏幕与系统录音 → `+`，选 `native/build/screen2gif.app`；没授权时菜单里会出现「打开屏幕录制设置…」。`build.sh` 用自签名证书 `screen2gif Dev`（login keychain 中受信任的代码签名根）签名，designated requirement 只认 bundle id + 证书哈希，所以重建不会掉授权；证书若丢失，脚本会退回 ad-hoc 并告警，那时每次重建都得重新授权。构建还依赖 `~/Developer/.swift-sdk-fix/` 的工具链补丁（原因见 `native/build.sh` 头部注释）。agent 调用仍走 CLI。
+注意：屏幕录制权限归属这个 .app，而且系统不会主动弹授权框（菜单栏 agent + 本地签名），必须手动加一次：系统设置 → 隐私与安全性 → 屏幕与系统录音 → `+`，选 `native/build/screen2gif.app`。app 启动时即自检权限与依赖：缺权限时菜单直接出现「打开屏幕录制设置…」，缺 node/ffmpeg 时出现「安装缺失依赖…」（走 Homebrew，装完即用），不用等第一次录制失败才发现。`build.sh` 用自签名证书 `screen2gif Dev`（login keychain 中受信任的代码签名根）签名，designated requirement 只认 bundle id + 证书哈希，所以重建不会掉授权；证书若丢失，脚本会退回 ad-hoc 并告警，那时每次重建都得重新授权。构建还依赖 `~/Developer/.swift-sdk-fix/` 的工具链补丁（原因见 `native/build.sh` 头部注释）。agent 调用仍走 CLI。
 
 ## 目录
 
