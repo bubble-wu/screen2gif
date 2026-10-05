@@ -65,7 +65,8 @@ final class HotKeyCenter {
   private var refs: [HotKeyAction: EventHotKeyRef] = [:]
   private var installed = false
 
-  func register(_ action: HotKeyAction, combo: KeyCombo) {
+  @discardableResult
+  func register(_ action: HotKeyAction, combo: KeyCombo) -> Bool {
     unregister(action)
     installHandlerIfNeeded()
 
@@ -80,10 +81,11 @@ final class HotKeyCenter {
       &ref)
     if status == noErr, let ref {
       refs[action] = ref
-    } else {
-      // 常见于组合键被其他 app 占用（errHotKeyExistsErr）
-      dbg("hotkey register failed: \(action.rawValue) status=\(status)")
+      return true
     }
+    // 常见于组合键被其他 app 占用（errHotKeyExistsErr）
+    dbg("hotkey register failed: \(action.rawValue) status=\(status)")
+    return false
   }
 
   func unregister(_ action: HotKeyAction) {
@@ -140,6 +142,8 @@ final class ShortcutStore: ObservableObject {
   static let shared = ShortcutStore()
 
   @Published private(set) var combos: [HotKeyAction: KeyCombo?] = [:]
+  /// 注册失败（通常是组合被其他应用占用）的动作，菜单/设置里提示用户
+  @Published private(set) var conflicts: Set<HotKeyAction> = []
 
   private init() {
     for action in HotKeyAction.allCases {
@@ -149,13 +153,17 @@ final class ShortcutStore: ObservableObject {
 
   /// 启动时（或恢复默认后）按当前配置注册全部热键
   func registerAll() {
+    var failed: Set<HotKeyAction> = []
     for (action, combo) in combos {
       if let combo {
-        HotKeyCenter.shared.register(action, combo: combo)
+        if !HotKeyCenter.shared.register(action, combo: combo) {
+          failed.insert(action)
+        }
       } else {
         HotKeyCenter.shared.unregister(action)
       }
     }
+    conflicts = failed
   }
 
   func setCombo(_ combo: KeyCombo?, for action: HotKeyAction) {

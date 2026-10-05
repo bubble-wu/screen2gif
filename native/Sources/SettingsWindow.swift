@@ -52,13 +52,20 @@ struct ShortcutsSettingsView: View {
 
       VStack(spacing: 8) {
         ForEach(HotKeyAction.allCases) { action in
-          HStack {
-            Text(action.title)
-            Spacer()
-            ShortcutRecorderField(combo: store.combos[action] ?? nil) {
-              store.setCombo($0, for: action)
+          VStack(alignment: .leading, spacing: 3) {
+            HStack {
+              Text(action.title)
+              Spacer()
+              ShortcutRecorderField(combo: store.combos[action] ?? nil) {
+                store.setCombo($0, for: action)
+              }
+              .frame(width: 110, height: 24)
             }
-            .frame(width: 110, height: 24)
+            if store.conflicts.contains(action) {
+              Text("注册失败：组合可能已被其他应用占用，请更换")
+                .font(.caption)
+                .foregroundStyle(.red)
+            }
           }
         }
       }

@@ -12,6 +12,7 @@ final class Recorder: NSObject, SCRecordingOutputDelegate {
     case queryContentFailed(Error)
     case startFailed(Error)
     case addOutputFailed(Error)
+    case timeout
 
     var errorDescription: String? {
       switch self {
@@ -19,6 +20,7 @@ final class Recorder: NSObject, SCRecordingOutputDelegate {
       case .queryContentFailed(let e): return "查询可录内容失败：\(e.localizedDescription)"
       case .startFailed(let e): return "开始采集失败：\(e.localizedDescription)"
       case .addOutputFailed(let e): return "挂录制输出失败：\(e.localizedDescription)"
+      case .timeout: return "启动录制超时"
       }
     }
   }
@@ -35,23 +37,22 @@ final class Recorder: NSObject, SCRecordingOutputDelegate {
 
   // region 为 CG 坐标（点，左上原点）；nil = 整屏
   // excluding：要从画面里剔除的窗口（录制状态条等 UI），按 windowNumber 匹配
-  func start(region: CGRect?, to url: URL, excluding excluded: [NSWindow] = []) throws {
-    let sem = DispatchSemaphore(value: 0)
-    var displays: [SCDisplay] = []
-    var allWindows: [SCWindow] = []
-    var queryError: Error?
-    Task {
-      do {
-        let content = try await SCShareableContent.current
-        displays = content.displays
-        allWindows = content.windows
-      } catch {
-        queryError = error
+  //
+  // async 版本：曾经用信号量在调用线程上同步等 SCShareableContent 查询和
+  // startCapture，而调用方是 @MainActor 的 Model.start——查询期间整个 UI
+  // 冻结、状态条渲染被推迟，还连锁推迟了对焦快照的 Task（要等主线程空出来），
+  // Glass 提示音因此比实际开录晚约半秒。现在 await 让主线程立即返回。
+  func start(region: CGRect?, to url: URL, excluding excluded: [NSWindow] = []) async throws {
+    let content: SCShareableContent
+    do {
+      content = try await Self.withTimeout(seconds: 10) {
+        try await SCShareableContent.current
       }
-      sem.signal()
+    } catch {
+      throw RecorderError.queryContentFailed(error)
     }
-    sem.wait()
-    if let queryError { throw RecorderError.queryContentFailed(queryError) }
+    let displays = content.displays
+    let allWindows = content.windows
     guard !displays.isEmpty else { throw RecorderError.noDisplay }
 
     // displays 的顺序不保证主屏在前；圈选 overlay 只出现在主屏，全屏也默认主屏。
@@ -110,14 +111,19 @@ final class Recorder: NSObject, SCRecordingOutputDelegate {
       throw RecorderError.addOutputFailed(error)
     }
 
-    let startSem = DispatchSemaphore(value: 0)
-    var startError: Error?
-    stream.startCapture { error in
-      startError = error
-      startSem.signal()
+    // startCapture 的回调若永远不来，不能让流程无限悬挂
+    do {
+      try await Self.withTimeout(seconds: 10) {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+          stream.startCapture { error in
+            if let error { cont.resume(throwing: error) }
+            else { cont.resume(returning: ()) }
+          }
+        }
+      }
+    } catch {
+      throw RecorderError.startFailed(error)
     }
-    startSem.wait()
-    if let startError { throw RecorderError.startFailed(startError) }
 
     self.stream = stream
     self.recordingOutput = output
@@ -129,6 +135,28 @@ final class Recorder: NSObject, SCRecordingOutputDelegate {
     guard let stream, isRecording else { return }
     isRecording = false
     stream.stopCapture { _ in }
+  }
+
+  // MARK: - 超时包装
+
+  /// 带超时的 await：op 的结果或 .timeout，先到先得（resume-once 由锁保证）。
+  /// 不用 task group 是因为它要求 ChildTaskResult: Sendable，系统类型未必满足。
+  private static func withTimeout<T>(seconds: Double, _ op: @escaping () async throws -> T) async throws -> T {
+    let once = TimeoutOnce()
+    return try await withCheckedThrowingContinuation { cont in
+      Task {
+        do {
+          let value = try await op()
+          if once.claim() { cont.resume(returning: value) }
+        } catch {
+          if once.claim() { cont.resume(throwing: error) }
+        }
+      }
+      Task {
+        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        if once.claim() { cont.resume(throwing: RecorderError.timeout) }
+      }
+    }
   }
 
   // MARK: SCRecordingOutputDelegate
@@ -151,5 +179,19 @@ final class Recorder: NSObject, SCRecordingOutputDelegate {
     stream = nil
     self.recordingOutput = nil
     outURL = nil
+  }
+}
+
+
+/// withTimeout 的 resume-once 守卫：先到先得，后到者作废
+private final class TimeoutOnce: @unchecked Sendable {
+  private let lock = NSLock()
+  private var claimed = false
+
+  func claim() -> Bool {
+    lock.lock(); defer { lock.unlock() }
+    if claimed { return false }
+    claimed = true
+    return true
   }
 }

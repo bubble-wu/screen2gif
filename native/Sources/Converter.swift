@@ -19,21 +19,52 @@ enum Converter {
       ?? FileManager.default.homeDirectoryForCurrentUser
     let out = desktop.appendingPathComponent("screen2gif-\(stampFormatter.string(from: Date())).gif")
 
+    // CLI 靠 bundle 相对路径定位，app 被挪离 native/build/ 就找不到；
+    // 与其报含糊的「文件打不开」，不如把缺失路径说清楚
+    let cli = cliURL()
+    guard FileManager.default.isExecutableFile(atPath: cli.path) else {
+      completion(.failure(NSError(
+        domain: "screen2gif", code: 2,
+        userInfo: [NSLocalizedDescriptionKey:
+          "找不到转码 CLI：\(cli.path)。app 需在 native/build/ 原位运行，或自行放置 bin/screen2gif"])))
+      return
+    }
+
     let process = Process()
-    process.executableURL = cliURL()
+    process.executableURL = cli
     // 圈选录制时用户已经框定取景，禁用 auto 裁剪，避免成片被裁到只剩运动区域
     process.arguments = ["convert", mov.path, "-o", out.path]
       + (regionPicked ? ["--crop", "off"] : [])
     var env = ProcessInfo.processInfo.environment
     env["PATH"] = searchPATH()
     process.environment = env
+    // CLI 的具体诊断（node/ffmpeg 缺失、编码失败…）都写在 stderr，
+    // 只透出 exit code 的话用户永远看不到真实原因。
+    // stderr 量很小（< 64KB 管道缓冲），进程退出后一次读完即可，无死锁风险。
+    let errPipe = Pipe()
+    process.standardError = errPipe
+    // 看门狗：CLI/ffmpeg 卡死时强杀并走失败路径，GUI 不至于永远停在「转码中…」
+    let watchdog = DispatchWorkItem {
+      if process.isRunning { process.terminate() }
+    }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 600, execute: watchdog)
     process.terminationHandler = { proc in
+      watchdog.cancel()
+      let errText = String(
+        data: errPipe.fileHandleForReading.readDataToEndOfFile(),
+        encoding: .utf8) ?? ""
+      let lastLine = errText
+        .split(separator: "\n")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .last(where: { !$0.isEmpty })
       if proc.terminationStatus == 0 {
         completion(.success(out))
       } else {
+        let detail = lastLine.map { "：\($0)" } ?? ""
         completion(.failure(NSError(
           domain: "screen2gif", code: Int(proc.terminationStatus),
-          userInfo: [NSLocalizedDescriptionKey: "转码失败（exit \(proc.terminationStatus)）"])))
+          userInfo: [NSLocalizedDescriptionKey:
+            "转码失败（exit \(proc.terminationStatus)）\(detail)"])))
       }
     }
     do {
@@ -45,16 +76,27 @@ enum Converter {
 
   // GUI app 继承的 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin，
   // CLI 的 shebang（env node）和它要调的 ffmpeg 都不在里面，必须自己拼。
+  // 覆盖常见 node 版本管理器：nvm / fnm / volta / asdf。
   static func searchPATH() -> String {
+    let home = FileManager.default.homeDirectoryForCurrentUser
     var dirs = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"]
-    let nvm = FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent(".nvm/versions/node")
+    let nvm = home.appendingPathComponent(".nvm/versions/node")
     if let versions = try? FileManager.default.contentsOfDirectory(atPath: nvm.path) {
       // 字典序会把 v9 排在 v22 前面，按数字逐段比较、新版本优先
       dirs += versions
         .sorted(by: newestFirst)
         .map { nvm.appendingPathComponent("\($0)/bin").path }
     }
+    let fnm = home.appendingPathComponent(".local/share/fnm/node-versions")
+    if let versions = try? FileManager.default.contentsOfDirectory(atPath: fnm.path) {
+      dirs += versions
+        .sorted(by: newestFirst)
+        .map { fnm.appendingPathComponent("\($0)/installation/bin").path }
+    }
+    dirs += [
+      home.appendingPathComponent(".volta/bin").path,
+      home.appendingPathComponent(".asdf/shims").path,
+    ]
     dirs += ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
     return dirs.joined(separator: ":")
   }

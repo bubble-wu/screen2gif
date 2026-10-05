@@ -3,7 +3,7 @@ import ScreenCaptureKit
 import SwiftUI
 
 // 录制中的可视指示，全屏与框选共用同一套：
-//   1. 红框（仅框选）：画在选区之外、对鼠标透明，不入镜、不挡操作。
+//   1. 角标 + 对焦虚化（仅框选）：画在选区之外、对鼠标透明，不入镜、不挡操作。
 //   2. 状态条（两种模式）：REC 红点（每秒闪烁）+ 已录时长 + 「停止」按钮。
 // 位置规则：
 //   框选 → 选区正上方（选区外的画面，天然不入镜）；
@@ -23,6 +23,8 @@ enum RecordingOverlay {
         hide()
         var windows: [NSWindow] = []
 
+        var pickedRegion: CGRect?
+        var pickedBorderView: BorderView?
         if let region, let screen = NSScreen.screens.first {
             // 28pt 余量：除了角标本身，还要容纳对焦动画的外扩起点（22pt）
             let side: CGFloat = 28
@@ -46,18 +48,8 @@ enum RecordingOverlay {
             w.orderFrontRegardless()
             borderWindow = w
             windows.append(w)
-
-            // 对焦开场 = 选区内容虚化→清晰 + 角标收拢，两者要同步开始，
-            // 所以等快照抓好了才 beginFocus（此刻 overlay 已上屏，
-            // 抓图时把自己排除，避免把角标冻进快照）
-            Task { @MainActor in
-                let snap = await Self.captureRegion(region, excluding: w)
-                borderView.beginFocus(snapshot: snap, onFocused: onFocused)
-            }
-            // 抓图卡死时的兜底：到点强制开场（只有角标收拢，无虚化）
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                borderView.beginFocus(snapshot: nil, onFocused: onFocused)
-            }
+            pickedRegion = region
+            pickedBorderView = borderView
         }
 
         // 状态条：先量尺寸再定位
@@ -101,6 +93,22 @@ enum RecordingOverlay {
         barPanel = panel
         windows.append(panel)
 
+        // 对焦开场 = 选区内容虚化→清晰 + 角标收拢，两者要同步开始，
+        // 所以等快照抓好了才 beginFocus。此刻全部 overlay 已上屏：
+        // 抓图时把它们整体排除——不只角标窗，还有状态条（选区贴屏幕顶时
+        // 状态条会被移入选区内，不排除就会冻进虚化背景约 0.4 秒）。
+        if let region = pickedRegion, let borderView = pickedBorderView {
+            let excluded = windows
+            Task { @MainActor in
+                let snap = await Self.captureRegion(region, excluding: excluded)
+                borderView.beginFocus(snapshot: snap, onFocused: onFocused)
+            }
+            // 抓图卡死时的兜底：到点强制开场（只有角标收拢，无虚化）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                borderView.beginFocus(snapshot: nil, onFocused: onFocused)
+            }
+        }
+
         return windows
     }
 
@@ -115,7 +123,7 @@ enum RecordingOverlay {
     /// CGWindowListCreateImage / CGDisplayCreateImage 在 macOS 26 SDK 均
     /// unavailable，只能走 SCScreenshotManager（异步）。
     @MainActor
-    private static func captureRegion(_ region: CGRect, excluding excluded: NSWindow) async -> CGImage? {
+    private static func captureRegion(_ region: CGRect, excluding excluded: [NSWindow]) async -> CGImage? {
         guard let screen = NSScreen.screens.first else { return nil }
         let rect = region.intersection(CGRect(origin: .zero, size: screen.frame.size))
         guard !rect.isNull, rect.width > 8, rect.height > 8 else { return nil }
@@ -125,7 +133,9 @@ enum RecordingOverlay {
                 ?? content.displays.first
             guard let display else { return nil }
             // overlay 已上屏，不把自己排除就会把角标冻进快照
-            let excludedSC = content.windows.filter { $0.windowID == excluded.windowNumber }
+            let excludedSC = content.windows.filter { sc in
+                excluded.contains { $0.windowNumber == sc.windowID }
+            }
             let filter = SCContentFilter(display: display, excludingWindows: excludedSC)
 
             // 这里的 captureImage 收 SCStreamConfiguration（与 Recorder 同一套数学）：
@@ -307,16 +317,26 @@ private final class CornerMarkView: NSView {
 /// 这段动画只给用户看，不会录进成片。
 private final class FocusBlurView: NSView {
     private let snapshot: CGImage
-    private let ciImage: CIImage
+    // 降采样工作图：虚化态本就看不出细节，长边 1200px 足够；
+    // 2x 屏近 5K 的快照逐帧全尺寸 CIGaussianBlur 跟不上 30fps，
+    // 任务会排队堆积。最后一帧仍用全分辨率快照，收尾最锐。
+    private let workImage: CIImage
+    private let workScale: CGFloat
     private let ciContext = CIContext()
     private var timer: Timer?
+    private var nextSeq = 0
+    private var appliedSeq = 0
+    private var finished = false
     private let duration: TimeInterval = 0.42
     private let maxSigma: Double = 14
     private let startTime = CACurrentMediaTime()
 
     init(snapshot: CGImage) {
         self.snapshot = snapshot
-        self.ciImage = CIImage(cgImage: snapshot)
+        let full = CIImage(cgImage: snapshot)
+        let s = min(1, 1200 / max(full.extent.width, full.extent.height))
+        self.workScale = s
+        self.workImage = full.transformed(by: CGAffineTransform(scaleX: s, y: s))
         super.init(frame: .zero)
         wantsLayer = true
         layer?.contents = snapshot
@@ -359,11 +379,14 @@ private final class FocusBlurView: NSView {
     }
 
     private func renderAsync(sigma: Double) {
-        let image = ciImage
+        nextSeq += 1
+        let seq = nextSeq
+        let image = workImage
         let context = ciContext
-        let extent = ciImage.extent
+        let extent = workImage.extent
         let sharp = snapshot
-        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+        let scaledSigma = sigma * Double(workScale)
+        DispatchQueue.global(qos: .userInteractive).async { [self] in
             let output: CGImage
             if sigma < 0.4 {
                 output = sharp
@@ -373,15 +396,22 @@ private final class FocusBlurView: NSView {
                 clamp.setValue(image, forKey: kCIInputImageKey)
                 let blur = CIFilter(name: "CIGaussianBlur")!
                 blur.setValue(clamp.outputImage, forKey: kCIInputImageKey)
-                blur.setValue(sigma, forKey: "inputRadius")
+                blur.setValue(scaledSigma, forKey: "inputRadius")
                 output = context.createCGImage(
                     blur.outputImage!.cropped(to: extent), from: extent)!
             }
-            DispatchQueue.main.async { self?.layer?.contents = output }
+            DispatchQueue.main.async {
+                // 序号守卫：渲染完成顺序无保证，乱序返回的旧帧
+                // 不得覆盖新帧（否则动画尾部会「回糊」）
+                guard !self.finished, seq >= self.appliedSeq else { return }
+                self.appliedSeq = seq
+                self.layer?.contents = output
+            }
         }
     }
 
     private func finish() {
+        finished = true
         timer?.invalidate()
         timer = nil
         removeFromSuperview()

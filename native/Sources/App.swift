@@ -7,7 +7,7 @@ func dbg(_ message: String) {
 
 @MainActor
 final class Model: ObservableObject {
-  enum Phase { case idle, picking, recording, converting }
+  enum Phase { case idle, picking, starting, recording, converting }
 
   @Published var phase: Phase = .idle
   @Published var statusLine = ""
@@ -76,21 +76,26 @@ final class Model: ObservableObject {
       onStop: { [weak self] in self?.stop() },
       // 框选：对焦动画完成（画面清晰）时播 Glass——「清晰了 = 开始了」
       onFocused: { [weak self] in
-        guard let self, self.phase == .recording else { return }
+        guard let self, self.phase == .starting || self.phase == .recording else { return }
         Self.cue("Glass")
       })
-    do {
-      try recorder.start(region: region, to: mov, excluding: overlayWindows)
-      regionPicked = (region != nil)
-      phase = .recording
-      statusLine = ""
-      needsPermission = false
-      if region == nil {
-        Self.cue("Glass")
+    // Recorder.start 已是 async：主线程不再被 SCShareableContent 查询/
+    // startCapture 阻塞，对焦快照的 Task 与开录并行推进，提示音不再漂移
+    phase = .starting
+    statusLine = ""
+    Task { @MainActor in
+      do {
+        try await recorder.start(region: region, to: mov, excluding: overlayWindows)
+        regionPicked = (region != nil)
+        phase = .recording
+        needsPermission = false
+        if region == nil {
+          Self.cue("Glass")
+        }
+      } catch {
+        RecordingOverlay.hide()
+        fail(error)
       }
-    } catch {
-      RecordingOverlay.hide()
-      fail(error)
     }
   }
 
@@ -164,6 +169,9 @@ struct MenuContent: View {
       if model.needsPermission {
         Button("打开屏幕录制设置…") { model.openScreenCaptureSettings() }
       }
+      if !shortcuts.conflicts.isEmpty {
+        Text("⚠ 有快捷键注册失败（可能被其他应用占用），可在「快捷键设置…」更换")
+      }
       Divider()
       Button("录制全屏\(hint(.fullscreen))") { model.startFullscreen() }
       Button("框选区域录制…\(hint(.region))") { model.startRegion() }
@@ -173,6 +181,8 @@ struct MenuContent: View {
       Button("退出") { NSApplication.shared.terminate(nil) }
     case .picking:
       Text("在屏幕上拖拽框选…（Esc 取消）")
+    case .starting:
+      Text("正在开始录制…")
     case .recording:
       Text("● 录制中 · 状态条可直接停止")
       Button("停止录制并转码\(hint(.stop))") { model.stop() }
@@ -254,10 +264,19 @@ struct Screen2GifApp: App {
 
     let mov = FileManager.default.temporaryDirectory
       .appendingPathComponent("s2g-selftest.mov")
-    do {
-      try recorder.start(region: region, to: mov)
-    } catch {
-      FileHandle.standardError.write("ERROR: \(error.localizedDescription)\n".data(using: .utf8)!)
+    // start 已是 async；自测在 runloop 之外跑，用信号量桥回同步。
+    // 必须 Task.detached：这里处于 @MainActor 的 App.init，普通 Task 会
+    // 继承 MainActor 排进主队列，而主线程正阻塞在下面的 wait() 上——死锁。
+    let startSem = DispatchSemaphore(value: 0)
+    var startError: Error?
+    Task.detached {
+      do { try await recorder.start(region: region, to: mov) }
+      catch { startError = error }
+      startSem.signal()
+    }
+    startSem.wait()
+    if let startError {
+      FileHandle.standardError.write("ERROR: \(startError.localizedDescription)\n".data(using: .utf8)!)
       exit(1)
     }
     FileHandle.standardError.write("recording \(seconds)s\n".data(using: .utf8)!)

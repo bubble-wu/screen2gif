@@ -76,7 +76,7 @@ s2g convert in.mov -o d.gif --crop 200,100,1600,1000
 
 ## 原生菜单栏 app（人在电脑前时更好用）
 
-`native/` 里是一个 SwiftUI 菜单栏 app：点图标选「录制全屏」或「框选区域录制…」（屏幕上拖拽，Esc 取消），也可以直接用全局快捷键。开始和结束各有一声提示音（Glass / Tink），圈选录制时选区外会出现红框（画在选区之外，不会入镜）。录完自动调用本仓库的 CLI 转码并在 Finder 里揭示桌面上的 GIF。采集走 ScreenCaptureKit（`SCRecordingOutput` 直接写 .mov），区域用 `SCStreamConfiguration.sourceRect` 裁（注意它是所选显示器自己的逻辑坐标系）。圈选录制转码时自动加 `--crop off`——圈选已经表达了取景意图，不再做运动区域裁剪；全屏录制保留 `--crop auto`。
+`native/` 里是一个 SwiftUI 菜单栏 app：点图标选「录制全屏」或「框选区域录制…」（屏幕上拖拽，Esc 取消），也可以直接用全局快捷键。开始和结束各有一声提示音（Glass / Tink），圈选录制时选区四周是取景角标（画在选区之外，不会入镜）。录完自动调用本仓库的 CLI 转码并在 Finder 里揭示桌面上的 GIF。采集走 ScreenCaptureKit（`SCRecordingOutput` 直接写 .mov），区域用 `SCStreamConfiguration.sourceRect` 裁（注意它是所选显示器自己的逻辑坐标系）。圈选录制转码时自动加 `--crop off`——圈选已经表达了取景意图，不再做运动区域裁剪；全屏录制保留 `--crop auto`。
 
 ### 录制状态条
 
@@ -97,6 +97,8 @@ s2g convert in.mov -o d.gif --crop 200,100,1600,1000
 ```sh
 cd native && ./build.sh && open build/screen2gif.app
 ```
+
+已知限制：框选 overlay、状态条、角标都画在主屏；多显示器下只能在主屏框选（全屏录制也默认主屏），副屏内容不会入镜。
 
 注意：屏幕录制权限归属这个 .app，而且系统不会主动弹授权框（菜单栏 agent + 本地签名），必须手动加一次：系统设置 → 隐私与安全性 → 屏幕与系统录音 → `+`，选 `native/build/screen2gif.app`；没授权时菜单里会出现「打开屏幕录制设置…」。`build.sh` 用自签名证书 `screen2gif Dev`（login keychain 中受信任的代码签名根）签名，designated requirement 只认 bundle id + 证书哈希，所以重建不会掉授权；证书若丢失，脚本会退回 ad-hoc 并告警，那时每次重建都得重新授权。构建还依赖 `~/Developer/.swift-sdk-fix/` 的工具链补丁（原因见 `native/build.sh` 头部注释）。agent 调用仍走 CLI。
 

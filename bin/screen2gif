@@ -88,11 +88,17 @@ function parseArgs(argv) {
         o.sensitivity = next();
         if (!SENSITIVITY[o.sensitivity]) fail(`--sensitivity 只能是 ${Object.keys(SENSITIVITY).join(' | ')}`);
         break;
-      case '--max-frames': o.maxFrames = Math.round(num(a, next())); break;
+      case '--max-frames':
+        o.maxFrames = Math.round(num(a, next()));
+        if (o.maxFrames < 1) fail('--max-frames 需为正整数（0 会被当成「无上限」，这里直接拒绝）');
+        break;
       case '--max-gap': o.maxGap = num(a, next()); break;
       case '--crop': o.crop = next(); break;
       case '--pad': o.pad = Math.round(num(a, next())); break;
-      case '-d': case '--duration': o.duration = num(a, next()); break;
+      case '-d': case '--duration':
+        o.duration = num(a, next());
+        if (o.duration <= 0) fail('-d 需为正数秒（0 会退化成手动模式，这里直接拒绝）');
+        break;
       case '-I': case '--interactive': o.interactive = true; break;
       case '--countdown': o.countdown = Math.max(0, Math.round(num(a, next()))); break;
       case '--silent': o.silent = true; break;
