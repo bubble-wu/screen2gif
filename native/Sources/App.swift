@@ -80,7 +80,15 @@ final class Model: ObservableObject {
       phase = .recording
       statusLine = ""
       needsPermission = false
-      Self.cue("Glass")
+      if region != nil {
+        // 框选有对焦动画：角标收拢完成（≈0.44s）再播 Glass，音画同步「清晰=开始」
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.44) { [weak self] in
+          guard let self, self.phase == .recording else { return }
+          Self.cue("Glass")
+        }
+      } else {
+        Self.cue("Glass")
+      }
     } catch {
       RecordingOverlay.hide()
       fail(error)

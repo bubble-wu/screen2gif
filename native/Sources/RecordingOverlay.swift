@@ -22,7 +22,8 @@ enum RecordingOverlay {
         var windows: [NSWindow] = []
 
         if let region, let screen = NSScreen.screens.first {
-            let side: CGFloat = 8
+            // 28pt 余量：除了角标本身，还要容纳对焦动画的外扩起点（22pt）
+            let side: CGFloat = 28
             // region 是 CG 坐标（左上原点），NSWindow 要 AppKit 全局坐标（左下原点）
             let frame = NSRect(
                 x: region.minX - side,
@@ -113,26 +114,117 @@ private final class BorderView: NSView {
         self.regionSize = regionSize
         super.init(frame: NSRect(
             origin: .zero,
-            size: CGSize(width: regionSize.width + 16, height: regionSize.height + 16)))
+            size: CGSize(width: regionSize.width + 56, height: regionSize.height + 56)))
+        setupCorners()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    // 选区在本视图坐标里的位置：四边各留 8pt
+    // 选区在本视图坐标里的位置：四边各留 28pt（对焦动画外扩也在窗内）
     private var regionRect: NSRect {
-        NSRect(x: 8, y: 8, width: regionSize.width, height: regionSize.height)
+        NSRect(x: 28, y: 28, width: regionSize.width, height: regionSize.height)
     }
 
+    /// 四个细角标（取景框风）。每个角是一个子 NSView，纯 AppKit 坐标，
+    /// 动画走 animator()（frame + alpha），不碰 CoreAnimation 的 layer 坐标歧义。
+    private func setupCorners() {
+        let gap: CGFloat = 4     // 角标与选区边缘间距
+        let arm: CGFloat = 15    // L 形臂长
+        let r = regionRect
+        let center = CGPoint(x: r.midX, y: r.midY)
+
+        // (拐点, 拐点在包围盒中的角)：拐点 = 选区角向外偏 gap
+        // 包围盒 = 拐点出发、沿两条臂方向的 arm×arm 方框
+        let specs: [(NSPoint, CornerMarkView.Corner)] = [
+            (NSPoint(x: r.minX - gap, y: r.minY - gap), .bottomLeft),
+            (NSPoint(x: r.maxX + gap, y: r.minY - gap), .bottomRight),
+            (NSPoint(x: r.minX - gap, y: r.maxY + gap), .topLeft),
+            (NSPoint(x: r.maxX + gap, y: r.maxY + gap), .topRight),
+        ]
+
+        for (pivot, corner) in specs {
+            let view = CornerMarkView(corner: corner, arm: arm)
+            let finalOrigin: NSPoint
+            switch corner {
+            case .bottomLeft: finalOrigin = pivot
+            case .bottomRight: finalOrigin = NSPoint(x: pivot.x - arm, y: pivot.y)
+            case .topLeft: finalOrigin = NSPoint(x: pivot.x, y: pivot.y - arm)
+            case .topRight: finalOrigin = NSPoint(x: pivot.x - arm, y: pivot.y - arm)
+            }
+            view.frame = NSRect(origin: finalOrigin, size: CGSize(width: arm, height: arm))
+            addSubview(view)
+
+            // 对焦动画：从拐点向外 22pt 的方向收拢到位（0.42s ease-out）。
+            // 方向 = 拐点相对选区中心的象限。
+            let dir = NSPoint(
+                x: pivot.x < center.x ? -22 : 22,
+                y: pivot.y < center.y ? -22 : 22)
+            view.setFrameOrigin(NSPoint(x: finalOrigin.x + dir.x, y: finalOrigin.y + dir.y))
+            view.alphaValue = 0
+
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.42
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                view.animator().alphaValue = 1
+                view.animator().setFrameOrigin(finalOrigin)
+            })
+
+            // 到位后闪一下（对焦清晰 = 录制开始）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.46) {
+                view.alphaValue = 0.25
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                    view.alphaValue = 1
+                }
+            }
+        }
+    }
+}
+
+/// 单个 L 形角标：深灰主线 + 白色 halo，深浅背景上都清晰。
+private final class CornerMarkView: NSView {
+    enum Corner { case topLeft, topRight, bottomLeft, bottomRight }
+
+    private let corner: Corner
+    private let arm: CGFloat
+
+    init(corner: Corner, arm: CGFloat) {
+        self.corner = corner
+        self.arm = arm
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
     override func draw(_ dirtyRect: NSRect) {
-        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        // path 从选区外扩 4pt、线宽 4pt → 红色实心带落在选区外 2..6pt，不会入镜
-        let border = CGPath(
-            roundedRect: regionRect.insetBy(dx: -4, dy: -4),
-            cornerWidth: 8, cornerHeight: 8, transform: nil)
-        ctx.addPath(border)
-        ctx.setStrokeColor(NSColor.systemRed.withAlphaComponent(0.95).cgColor)
-        ctx.setLineWidth(4)
-        ctx.strokePath()
+        // L 的两个端点：拐点 + 沿两臂方向（bounds y 向上）
+        let (pivot, e1, e2): (NSPoint, NSPoint, NSPoint)
+        switch corner {
+        case .bottomLeft:
+            pivot = .zero
+            e1 = NSPoint(x: arm, y: 0); e2 = NSPoint(x: 0, y: arm)
+        case .bottomRight:
+            pivot = NSPoint(x: arm, y: 0)
+            e1 = .zero; e2 = NSPoint(x: arm, y: arm)
+        case .topLeft:
+            pivot = NSPoint(x: 0, y: arm)
+            e1 = NSPoint(x: arm, y: arm); e2 = .zero
+        case .topRight:
+            pivot = NSPoint(x: arm, y: arm)
+            e1 = NSPoint(x: 0, y: arm); e2 = NSPoint(x: arm, y: 0)
+        }
+
+        let path = NSBezierPath()
+        path.move(to: pivot); path.line(to: e1)
+        path.move(to: pivot); path.line(to: e2)
+        path.lineCapStyle = .round
+
+        // 白色 halo 先画（粗），深灰主线后画（细）——任何背景都可见
+        path.lineWidth = 4.5
+        NSColor.white.withAlphaComponent(0.9).setStroke()
+        path.stroke()
+        path.lineWidth = 2
+        NSColor(calibratedWhite: 0.24, alpha: 1).setStroke()
+        path.stroke()
     }
 }
 
