@@ -15,14 +15,20 @@
 
 ## 安装
 
-无需安装。直接调用：
+无需安装。clone 后直接调用：
 
 ```sh
-~/Developer/screen2gif/bin/screen2gif doctor     # 自检依赖与权限
-~/Developer/screen2gif/bin/screen2gif record -d 8 -o demo.gif
+git clone https://github.com/bubble-wu/screen2gif.git
+cd screen2gif
+./bin/screen2gif doctor                  # 自检依赖与权限
+./bin/screen2gif record -d 8 -o demo.gif
 ```
 
-想全局可用：`ln -s ~/Developer/screen2gif/bin/screen2gif /opt/homebrew/bin/screen2gif`，或在 shell 里 `alias s2g='~/Developer/screen2gif/bin/screen2gif'`
+想全局可用：`ln -s "$(pwd)/bin/screen2gif" /opt/homebrew/bin/screen2gif`（在 clone 目录里执行），或在 shell 里 `alias s2g='<clone 路径>/bin/screen2gif'`
+
+### 作为 agent skill 使用
+
+仓库根目录带 `SKILL.md`，可注册给你所用的 agent：把整个目录（或 symlink）放进技能目录，例如 `ln -s "$(pwd)" ~/.agents/skills/screen2gif`。
 
 输出位置：不传 `-o` 时默认存**当前目录**（`s2g-<时间戳>.gif`）；`-o` 也接受目录（已存在或以 `/` 结尾），自动往里放时间戳文件名，`~/` 前缀会展开。菜单栏 app 默认存桌面，菜单里的「输出位置…」可改。
 
@@ -109,7 +115,7 @@ wait
 
 ### 录制状态条
 
-![拖拽框选录制区域](screenshots/region-picker.png)
+![框选录制：状态条悬在选区上方，不入镜](screenshots/region-picker.png)
 
 录制中屏幕顶部会出现一条深色胶囊状态条（全屏和框选共用同一套）：红色 REC 圆点每秒闪烁、等宽数字计时、右侧「停止」按钮点一下即停——不用再去找菜单栏图标。它对鼠标点击生效但**不抢焦点**（nonactivating panel），点停止不会把正在演示的应用晃出去。框选时状态条在选区正上方（选区外，天然不入镜；选区贴屏幕顶时移入选区内）；全屏时在主屏顶部菜单栏下方，靠 `SCContentFilter(excludingWindows:)` 从采集里剔除，**不会被录进成片**。
 

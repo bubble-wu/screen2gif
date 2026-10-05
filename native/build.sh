@@ -1,22 +1,18 @@
 #!/bin/sh
 # 构建 screen2gif 菜单栏 app。
 #
-# 用打补丁的 SDK 和 VFS overlay，是因为这台机器的 CommandLineTools 自身不一致：
-# 编译器是 swiftlang-6.2.3.3.21，而 SDK 26.2 的 .swiftinterface 由 6.2.3.3.2 生成，
-# Swift 会拒绝（"this SDK is not supported by the compiler"）；同时
-# usr/include/swift/module.modulemap 是 2023 年的遗留副本，与 bridging.modulemap
-# 重复定义 SwiftBridging。~/Developer/.swift-sdk-fix/ 里是 APFS clone 出来的 SDK
-# 副本（改写了版本戳，几乎不占空间）加一个把旧 modulemap 换成空文件的 overlay。
-# CLT 干净重装后这两个参数都可以去掉。
+# 维护者这台机器的 CommandLineTools 自身不一致：编译器是 swiftlang-6.2.3.3.21，
+# 而 SDK 26.2 的 .swiftinterface 由 6.2.3.3.2 生成，Swift 会拒绝（"this SDK is not
+# supported by the compiler"）；同时 usr/include/swift/module.modulemap 是 2023 年的
+# 遗留副本，与 bridging.modulemap 重复定义 SwiftBridging。~/Developer/.swift-sdk-fix/
+# 里是 APFS clone 出来的 SDK 副本（改写了版本戳，几乎不占空间）加一个把旧 modulemap
+# 换成空文件的 overlay。下面检测到副本存在才启用；普通环境直接用系统默认 SDK。
 #
 # SwiftPM 在这台机器上另有故障（libPackageDescription 与其 swiftmodule 不匹配），
 # 所以直接用 swiftc 编译再手工组装 .app。
 set -eu
 cd "$(dirname "$0")"
 
-SDK="/Users/wububble/Developer/.swift-sdk-fix/MacOSX.sdk"
-VFS="/Users/wububble/Developer/.swift-sdk-fix/vfs.yaml"
-TARGET="arm64-apple-macosx26.2"
 APP="build/screen2gif.app"
 
 # 版本一致性校验：CLI（bin/screen2gif 的 VERSION）是唯一真源，Info.plist 靠手工同步，
@@ -30,9 +26,16 @@ PLIST_VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-swiftc -sdk "$SDK" -vfsoverlay "$VFS" -target "$TARGET" \
-  -parse-as-library -O -whole-module-optimization \
-  Sources/*.swift -o "$APP/Contents/MacOS/screen2gif"
+SDK_FIX="$HOME/Developer/.swift-sdk-fix"
+if [ -d "$SDK_FIX/MacOSX.sdk" ] && [ -f "$SDK_FIX/vfs.yaml" ]; then
+  swiftc -sdk "$SDK_FIX/MacOSX.sdk" -vfsoverlay "$SDK_FIX/vfs.yaml" \
+    -target arm64-apple-macosx26.2 \
+    -parse-as-library -O -whole-module-optimization \
+    Sources/*.swift -o "$APP/Contents/MacOS/screen2gif"
+else
+  swiftc -parse-as-library -O -whole-module-optimization \
+    Sources/*.swift -o "$APP/Contents/MacOS/screen2gif"
+fi
 
 cp Info.plist "$APP/Contents/Info.plist"
 
