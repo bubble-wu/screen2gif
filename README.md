@@ -31,6 +31,7 @@ s2g record -d 8 -o demo.gif              # 录 8 秒并出图
 s2g record -o demo.gif                   # 交互终端：Enter 开始 → Enter 停止
 s2g record -I -o demo.gif                # 用 macOS 原生工具条，菜单栏按钮停止
 s2g record --region window -d 6 -o d.gif # 只录前台窗口
+s2g record --then 'bash 操作脚本.sh' -o d.gif   # 边录边执行命令，命令结束即停
 s2g convert 已有录屏.mov -o demo.gif      # 转已有视频
 s2g convert in.mov -o d.gif --crop off   # 不裁剪
 s2g convert in.mov -o d.gif --crop 200,100,1600,1000
@@ -38,15 +39,35 @@ s2g convert in.mov -o d.gif --crop 200,100,1600,1000
 
 ## 开始与结束
 
-三种控制方式，都有倒计时和提示音（每秒一声 Tink，开始一声 Glass，结束一声 Tink）：
+四种控制方式，都有倒计时和提示音（每秒一声 Tink，开始一声 Glass，结束一声 Tink）：
 
 | 方式 | 开始 | 结束 |
 |---|---|---|
 | `-d <秒>` | 倒计时后自动 | 到时自动 |
+| `--then '<命令>'` | 立即（倒计时默认 0） | 命令（交 `sh -c`，输出透传）退出即停 |
 | 手动（默认，需 TTY） | 终端按 Enter | 终端再按 Enter，或 Ctrl-C |
 | `-I, --interactive` | 倒计时后自动开始，同时弹出原生录制工具条 | 菜单栏停止按钮（任何 App 里都能点），或终端 Enter / Ctrl-C |
 
-`--countdown 0` 跳过倒计时，`--silent` 关闭提示音。Ctrl-C 走的是同一条停止路径，会正常写完文件并继续转码。`-I` 的时长由停止按钮决定，所以不能与 `-d` 同用；`--region` 仍然有效。
+`--countdown 0` 跳过倒计时，`--silent` 关闭提示音。Ctrl-C 走的是同一条停止路径，会正常写完文件并继续转码。`-I` 的时长由停止按钮决定，所以不能与 `-d` 同用；`--then` 的时长由命令决定，不能与 `-d` / `-I` 同用，命令退出码非 0 时仍会出图（ stderr 给警告——失败的操作过程往往正是要看的）；`--region` 在两者下都有效。
+
+### 给 agent / 脚本：自动化编排
+
+让程序驱动屏幕操作并录下来，两种范式：
+
+```sh
+# 范式一：--then 一条龙（首选）——真正开录后才执行命令，命令退出即停
+s2g record --then 'bash drive-ops.sh' --json -o demo.gif
+
+# 范式二：外部编排——--ready-file 在真正开始采集那一刻才创建，
+# 等它出现再动手，操作不会被倒计时吞掉开头（起跑前先 rm 掉旧信号，避免误读残留）
+rm -f /tmp/s2g-ready
+s2g record -d 15 --countdown 0 --ready-file /tmp/s2g-ready -o demo.gif &
+while [ ! -f /tmp/s2g-ready ]; do sleep 0.2; done
+# ……执行要被录下来的操作……
+wait
+```
+
+`--json` 成功时在 stdout 输出单行结果（`gif` 路径、`bytes`、`frames`、`gifDuration`、`crop`、`elapsed`，`--then` 时含 `commandExit`），供程序化取用，不必解析人话日志。时长宁长勿短：静止画面会被关键帧抽取与 `--max-gap` 压掉，多录不亏。
 
 ## 管线是怎么工作的
 
@@ -64,6 +85,7 @@ s2g convert in.mov -o d.gif --crop 200,100,1600,1000
 - `--crop auto|off|x,y,w,h`：`auto` 检测运动包围盒；运动覆盖全画面时自动退化为不裁剪。
 - `--region screen|window|x,y,w,h`：录制范围，单位是屏幕点（录屏输出为 2 倍像素）。
 - `--max-gap`：单帧最长停留，把长静默截断，避免 GIF 看起来卡死。
+- `--then '<命令>'` / `--ready-file <路径>` / `--json`：自动化编排三件套，见上节。
 - `--keep-frames` / `--keep-mov`：保留中间产物供检查。
 
 ## 故障排查
@@ -115,7 +137,7 @@ cd native && ./build.sh && open build/screen2gif.app
 ```
 screenshots/     README 演示截图
 bin/screen2gif   CLI 入口与参数解析
-lib/record.mjs   screencapture 封装（定时/手动停止、看门狗、窗口区域）
+lib/record.mjs   screencapture 封装（定时/手动/外控停止、看门狗、窗口区域、就绪信号）
 lib/video.mjs    ffprobe 探测、关键帧抽取、运动包围盒、GIF 编码
 native/          菜单栏 app（ScreenCaptureKit 采集 + 框选 overlay + 调 CLI 转码）
 SKILL.md         给 Qoder 的技能说明

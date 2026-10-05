@@ -4,6 +4,7 @@
 import { mkdtemp, rm, readdir, stat, copyFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, basename, dirname } from 'node:path';
+import { spawn } from 'node:child_process';
 import {
   ffmpeg, ffprobe, probe, detectCrop, normalizeCrop, extractKeyframes,
   applyFrameCap, computeDelays, buildConcatList, encodeGif, SENSITIVITY,
@@ -11,7 +12,7 @@ import {
 import { record, frontWindowRegion, checkPermission } from '../lib/record.mjs';
 import { ensureFfmpeg, binWorks, responsibleAppName, openScreenCaptureSettings } from '../lib/deps.mjs';
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 
 const HELP = `screen2gif ${VERSION} — 录屏 → 关键帧 → 裁剪 → GIF
 
@@ -40,6 +41,10 @@ const HELP = `screen2gif ${VERSION} — 录屏 → 关键帧 → 裁剪 → GIF
   -d, --duration <秒>     定时录制；省略则按 Enter 手动停止
   -I, --interactive       用 macOS 原生录屏工具条：立即开始录制，点菜单栏
                           的停止按钮结束（在任何 App 里都能点）
+      --then '<命令>'     录制期间执行命令（交给 sh -c），命令结束即停止录制；
+                          与 -d/-I 互斥，倒计时默认 0，命令退出码非 0 会警告
+      --ready-file <路径> 真正开始采集那一刻创建该文件（开跑前先清掉旧文件），
+                          供外部脚本/agent 轮询等待录制就绪
       --countdown <秒>    开始前的倒计时 (默认 3，0 = 关闭)
       --silent            关闭开始/结束提示音
       --region <模式>     screen | window | x,y,w,h，单位为屏幕点 (默认 screen)
@@ -52,6 +57,7 @@ const HELP = `screen2gif ${VERSION} — 录屏 → 关键帧 → 裁剪 → GIF
       --keep-frames       保留关键帧 PNG 到输出目录
       --verbose           打印实际执行的 ffmpeg 命令
   -q, --quiet             只输出结果
+      --json              成功时 stdout 输出单行 JSON（路径/帧数/时长/体积等）
   -h, --help              显示帮助
   -V, --version           显示版本`;
 
@@ -66,6 +72,7 @@ function parseArgs(argv) {
     fps: 10, sensitivity: 'default', maxFrames: 240, maxGap: 2.0,
     crop: 'auto', pad: null, duration: null, region: 'screen',
     clicks: false, display: null, interactive: false, countdown: 3, silent: false,
+    then: null, readyFile: null, json: false,
     keepMov: false, keepFrames: false,
     verbose: false, quiet: false,
   };
@@ -103,6 +110,14 @@ function parseArgs(argv) {
         if (o.duration <= 0) fail('-d 需为正数秒（0 会退化成手动模式，这里直接拒绝）');
         break;
       case '-I': case '--interactive': o.interactive = true; break;
+      case '--then':
+        o.then = next();
+        if (!o.then.trim()) fail('--then 需要一个命令字符串');
+        break;
+      case '--ready-file':
+        o.readyFile = next();
+        if (!o.readyFile.trim()) fail('--ready-file 需要一个路径');
+        break;
       case '--countdown': o.countdown = Math.max(0, Math.round(num(a, next()))); break;
       case '--silent': o.silent = true; break;
       case '--region': o.region = next(); break;
@@ -112,6 +127,7 @@ function parseArgs(argv) {
       case '--keep-frames': o.keepFrames = true; break;
       case '--verbose': o.verbose = true; break;
       case '-q': case '--quiet': o.quiet = true; break;
+      case '--json': o.json = true; break;
       case '-h': case '--help': process.stdout.write(HELP + '\n'); process.exit(0); break;
       case '-V': case '--version': process.stdout.write(VERSION + '\n'); process.exit(0); break;
       default:
@@ -120,6 +136,8 @@ function parseArgs(argv) {
         o.input = a;
     }
   }
+  // --then 的时长由命令决定，倒计时只会吞掉操作的开头——没显式给 --countdown 就归零
+  if (o.then && !argv.includes('--countdown')) o.countdown = 0;
   return o;
 }
 
@@ -225,6 +243,12 @@ async function convert(input, opts) {
       for (const f of frames) await copyFile(f, join(dest, basename(f)));
       log(`  关键帧已保留 ${dest}`);
     }
+    // 供 --json 输出的成片统计
+    return {
+      frames: frames.length,
+      gifDuration: delays.reduce((s, d) => s + d, 0) / 100,
+      crop: crop ? { x: crop.x, y: crop.y, w: crop.w, h: crop.h } : null,
+    };
   } finally {
     await rm(work, { recursive: true, force: true });
   }
@@ -247,24 +271,54 @@ async function cmdRecord(opts) {
   if (opts.interactive && opts.duration) {
     fail('--interactive 由菜单栏的原生停止按钮决定时长，不能与 -d 同用');
   }
+  if (opts.then && opts.duration) {
+    fail('--then 的时长由命令决定，不能与 -d 同用');
+  }
+  if (opts.then && opts.interactive) {
+    fail('--then 与 --interactive 不能同用（一个由命令控时，一个由菜单栏按钮控时）');
+  }
   const work = await mkdtemp(join(tmpdir(), 's2g-rec-'));
   const mov = join(work, 'capture.mov');
   try {
     const region = await resolveRegion(opts.region);
     if (region) log(`  录制区域 ${region.w}x${region.h}+${region.x}+${region.y} (屏幕点)`);
+
+    // --then 编排：真正开录（onStarted 回调）才 spawn 命令，命令退出（until
+    // 完成）即停录制。命令输出直接透传（stdio inherit）；退出码非 0 只警告，
+    // GIF 照常产出——失败的操作过程往往正是要看的东西
+    let thenExit = null;
+    let launchThen = null;
+    const until = opts.then ? new Promise((resolve) => {
+      launchThen = () => {
+        const child = spawn('/bin/sh', ['-c', opts.then], { stdio: 'inherit' });
+        child.on('exit', (code) => { thenExit = code ?? 1; resolve(); });
+        child.on('error', (e) => {
+          process.stderr.write(`✗ 无法执行 --then 命令：${e.message}\n`);
+          thenExit = 1;
+          resolve();
+        });
+      };
+    }) : null;
+
     const rec = await record({
       out: mov, duration: opts.duration, clicks: opts.clicks,
       display: opts.display, region, interactive: opts.interactive,
       countdown: opts.countdown, silent: opts.silent, quiet: opts.quiet,
       onEvent: opts.verbose ? (m) => log(`  $ ${m}`) : null,
+      onStarted: launchThen,
+      until, readyFile: opts.readyFile,
     });
     log(`  录屏完成 ${fmtBytes(rec.bytes)}`);
+    if (thenExit !== null && thenExit !== 0) {
+      log(`  ⚠ --then 命令退出码 ${thenExit}（GIF 仍已生成，供排查失败过程）`);
+    }
     if (opts.keepMov) {
       const dest = join(dirname(resolve(opts.out)), `${basename(opts.out, '.gif')}.mov`);
       await copyFile(mov, dest);
       log(`  原始录屏已保留 ${dest}`);
     }
-    await convert(mov, opts);
+    const conv = await convert(mov, opts);
+    return { ...conv, thenExit };
   } finally {
     await rm(work, { recursive: true, force: true });
   }
@@ -301,6 +355,9 @@ async function main() {
   }
   if (opts.cmd === 'doctor') return cmdDoctor();
 
+  if ((opts.then || opts.readyFile) && opts.cmd !== 'record') {
+    fail('--then / --ready-file 只在 record 时有效');
+  }
   if (opts.cmd === 'convert') {
     if (!opts.input) fail('convert 需要一个输入视频文件');
     if (opts.region !== 'screen') fail('--region 只在 record 时有效；convert 请用 --crop 指定裁剪区域');
@@ -317,10 +374,23 @@ async function main() {
   await mkdir(dirname(opts.out), { recursive: true });
 
   const started = Date.now();
-  if (opts.cmd === 'record') await cmdRecord(opts);
-  else await convert(opts.input, opts);
+  const conv = opts.cmd === 'record' ? await cmdRecord(opts) : await convert(opts.input, opts);
 
-  if (opts.quiet) {
+  if (opts.json) {
+    // 单行 JSON 到 stdout，供 agent 程序化取用；人看的日志仍在 stderr（-q 关掉）
+    const st = await stat(opts.out);
+    const result = {
+      ok: true,
+      gif: opts.out,
+      bytes: st.size,
+      frames: conv?.frames ?? null,
+      gifDuration: conv?.gifDuration ?? null,
+      crop: conv?.crop ?? null,
+      elapsed: +((Date.now() - started) / 1000).toFixed(1),
+    };
+    if (conv?.thenExit !== null && conv?.thenExit !== undefined) result.commandExit = conv.thenExit;
+    process.stdout.write(JSON.stringify(result) + '\n');
+  } else if (opts.quiet) {
     process.stdout.write(`${opts.out}\n`);
   } else {
     const st = await stat(opts.out);
