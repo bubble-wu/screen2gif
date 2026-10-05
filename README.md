@@ -20,7 +20,7 @@
 ~/Developer/screen2gif/bin/screen2gif record -d 8 -o demo.gif
 ```
 
-想全局可用：`ln -s ~/Developer/screen2gif/bin/screen2gif /opt/homebrew/bin/screen2gif`
+想全局可用：`ln -s ~/Developer/screen2gif/bin/screen2gif /opt/homebrew/bin/screen2gif`，或在 shell 里 `alias s2g='~/Developer/screen2gif/bin/screen2gif'`
 
 ## 快速上手
 
@@ -76,7 +76,7 @@ s2g convert in.mov -o d.gif --crop 200,100,1600,1000
 
 ## 原生菜单栏 app（人在电脑前时更好用）
 
-`native/` 里是一个 SwiftUI 菜单栏 app：点图标选「录制全屏」或「框选区域录制…」（屏幕上拖拽，Esc 取消），录完点「停止录制并转码」，自动调用本仓库的 CLI 转码并在 Finder 里揭示桌面上的 GIF。采集走 ScreenCaptureKit（`SCRecordingOutput` 直接写 .mov），区域用 `SCStreamConfiguration.sourceRect` 裁。
+`native/` 里是一个 SwiftUI 菜单栏 app：点图标选「录制全屏」或「框选区域录制…」（屏幕上拖拽，Esc 取消）。开始和结束各有一声提示音（Glass / Tink），圈选录制时选区外会出现红框 + REC 标记（画在选区之外，不会入镜），录完点「停止录制并转码」，自动调用本仓库的 CLI 转码并在 Finder 里揭示桌面上的 GIF。采集走 ScreenCaptureKit（`SCRecordingOutput` 直接写 .mov），区域用 `SCStreamConfiguration.sourceRect` 裁（注意它是所选显示器自己的逻辑坐标系）。圈选录制转码时自动加 `--crop off`——圈选已经表达了取景意图，不再做运动区域裁剪；全屏录制保留 `--crop auto`。
 
 ```sh
 cd native && ./build.sh && open build/screen2gif.app

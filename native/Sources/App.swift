@@ -14,6 +14,8 @@ final class Model: ObservableObject {
   @Published var needsPermission = false
 
   private let recorder = Recorder()
+  // 圈选已经表达了取景意图，转码时跳过 auto 裁剪，所见即所得
+  private var regionPicked = false
 
   init() {
     recorder.onFinished = { [weak self] mov in
@@ -53,19 +55,24 @@ final class Model: ObservableObject {
       .appendingPathComponent("s2g-\(UUID().uuidString).mov")
     do {
       try recorder.start(region: region, to: mov)
+      regionPicked = (region != nil)
       phase = .recording
       statusLine = ""
       needsPermission = false
+      RecordingOverlay.show(region: region)
+      Self.cue("Glass")
     } catch {
       fail(error)
     }
   }
 
   private func handleRecordingFinished(_ mov: URL) {
+    RecordingOverlay.hide()
+    Self.cue("Tink")
     phase = .converting
     statusLine = "转码中…"
     dbg("recording finished: \(mov.path)")
-    Converter.convert(mov: mov) { [weak self] result in
+    Converter.convert(mov: mov, regionPicked: regionPicked) { [weak self] result in
       DispatchQueue.main.async {
         guard let self else { return }
         switch result {
@@ -84,9 +91,15 @@ final class Model: ObservableObject {
 
   private func fail(_ error: Error) {
     dbg("fail: \(error.localizedDescription)")
+    RecordingOverlay.hide()
     phase = .idle
     statusLine = error.localizedDescription
     needsPermission = Self.isPermissionError(error)
+  }
+
+  // 与 CLI 一致的提示音：开始 Glass，结束 Tink
+  private static func cue(_ name: String) {
+    NSSound(contentsOf: URL(fileURLWithPath: "/System/Library/Sounds/\(name).aiff"), byReference: true)?.play()
   }
 
   // 未授权屏幕录制时 SCShareableContent 直接抛错，得把用户领到设置面板
@@ -177,7 +190,7 @@ struct Screen2GifApp: App {
     let mov = FileManager.default.temporaryDirectory
       .appendingPathComponent("s2g-selftest.mov")
     do {
-      try recorder.start(region: nil, to: mov)
+      try recorder.start(region: region, to: mov)
     } catch {
       FileHandle.standardError.write("ERROR: \(error.localizedDescription)\n".data(using: .utf8)!)
       exit(1)

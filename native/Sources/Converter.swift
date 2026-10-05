@@ -12,7 +12,7 @@ enum Converter {
       .appendingPathComponent("bin/screen2gif")
   }
 
-  static func convert(mov: URL, completion: @escaping (Result<URL, Error>) -> Void) {
+  static func convert(mov: URL, regionPicked: Bool, completion: @escaping (Result<URL, Error>) -> Void) {
     let stampFormatter = DateFormatter()
     stampFormatter.dateFormat = "yyyyMMdd-HHmmss"
     let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
@@ -21,7 +21,9 @@ enum Converter {
 
     let process = Process()
     process.executableURL = cliURL()
+    // 圈选录制时用户已经框定取景，禁用 auto 裁剪，避免成片被裁到只剩运动区域
     process.arguments = ["convert", mov.path, "-o", out.path]
+      + (regionPicked ? ["--crop", "off"] : [])
     var env = ProcessInfo.processInfo.environment
     env["PATH"] = searchPATH()
     process.environment = env
@@ -48,9 +50,27 @@ enum Converter {
     let nvm = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent(".nvm/versions/node")
     if let versions = try? FileManager.default.contentsOfDirectory(atPath: nvm.path) {
-      dirs += versions.sorted().reversed().map { nvm.appendingPathComponent("\($0)/bin").path }
+      // 字典序会把 v9 排在 v22 前面，按数字逐段比较、新版本优先
+      dirs += versions
+        .sorted(by: newestFirst)
+        .map { nvm.appendingPathComponent("\($0)/bin").path }
     }
     dirs += ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
     return dirs.joined(separator: ":")
+  }
+
+  private static func newestFirst(_ a: String, _ b: String) -> Bool {
+    let x = versionNumbers(a)
+    let y = versionNumbers(b)
+    for i in 0..<max(x.count, y.count) {
+      let l = i < x.count ? x[i] : 0
+      let r = i < y.count ? y[i] : 0
+      if l != r { return l > r }
+    }
+    return false
+  }
+
+  private static func versionNumbers(_ name: String) -> [Int] {
+    name.split(separator: ".").map { Int($0.filter(\.isNumber)) ?? 0 }
   }
 }

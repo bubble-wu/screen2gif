@@ -35,11 +35,11 @@ final class Recorder: NSObject, SCRecordingOutputDelegate {
   // region 为 CG 坐标（点，左上原点）；nil = 整屏
   func start(region: CGRect?, to url: URL) throws {
     let sem = DispatchSemaphore(value: 0)
-    var display: SCDisplay?
+    var displays: [SCDisplay] = []
     var queryError: Error?
     Task {
       do {
-        display = try await SCShareableContent.current.displays.first
+        displays = try await SCShareableContent.current.displays
       } catch {
         queryError = error
       }
@@ -47,17 +47,40 @@ final class Recorder: NSObject, SCRecordingOutputDelegate {
     }
     sem.wait()
     if let queryError { throw RecorderError.queryContentFailed(queryError) }
-    guard let display else { throw RecorderError.noDisplay }
+    guard !displays.isEmpty else { throw RecorderError.noDisplay }
 
-    let scale = CGFloat(display.width) / display.frame.width
+    // displays 的顺序不保证主屏在前；圈选 overlay 只出现在主屏，全屏也默认主屏。
+    // CG 全局坐标的原点 (0,0) 恒为主屏左上角，据此认主屏。
+    let display = (region.flatMap { r in
+      displays.first { $0.frame.contains(CGPoint(x: r.midX, y: r.midY)) }
+    } ?? displays.first { $0.frame.origin == .zero }) ?? displays[0]
+
+    // SCDisplay.width 报的是逻辑尺寸（HiDPI 屏上也是 1920 而非 3840），
+    // 真实像素密度必须从当前显示模式取，否则 2x 屏按 1x 采样，成片发虚。
+    let scale: CGFloat
+    if let mode = CGDisplayCopyDisplayMode(display.displayID) {
+      scale = CGFloat(mode.pixelWidth) / display.frame.width
+    } else {
+      scale = CGFloat(display.width) / display.frame.width
+    }
     let src = region ?? display.frame
+    // sourceRect 用的是所选显示器自己的逻辑坐标系（点，左上原点），
+    // 不是 CG 全局坐标——副屏必须减去该屏原点的偏移。
+    let srcRect = CGRect(
+      x: src.minX - display.frame.minX,
+      y: src.minY - display.frame.minY,
+      width: src.width,
+      height: src.height)
+    dbg("display \(display.displayID) frame=\(display.frame) scale=\(scale) sourceRect=\(srcRect)")
 
     let config = SCStreamConfiguration()
-    config.sourceRect = src
-    config.width = Int((src.width * scale).rounded())
-    config.height = Int((src.height * scale).rounded())
+    config.sourceRect = srcRect
+    config.width = Int((srcRect.width * scale).rounded())
+    config.height = Int((srcRect.height * scale).rounded())
     config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
     config.capturesAudio = false
+    // 按面板原生分辨率采集再缩放到 width/height；没有它 .auto 可能按 1x 采再放大
+    config.captureResolution = .best
 
     let filter = SCContentFilter(display: display, excludingWindows: [])
     let stream = SCStream(filter: filter, configuration: config, delegate: nil)
