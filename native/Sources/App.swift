@@ -17,6 +17,8 @@ final class Model: ObservableObject {
   @Published var missingDeps: [String] = []
   /// 「安装依赖」进行中：隐藏按钮 + 拦住重复点击（连点会起两个 brew）
   @Published private(set) var installing = false
+  /// 菜单里显示的输出目录（「输出位置：xxx」），选完即刷新
+  @Published private(set) var outputLabel = ""
 
   private let recorder = Recorder()
   // 圈选已经表达了取景意图，转码时跳过 auto 裁剪，所见即所得
@@ -55,6 +57,33 @@ final class Model: ObservableObject {
       }
     }
     missingDeps = Deps.missing()
+    outputLabel = Self.describeOutputDirectory(Converter.outputDirectory())
+  }
+
+  /// 菜单里的「输出位置…」：目录选择面板，存 UserDefaults，下次录制即生效。
+  /// 面板里能新建目录；选到的目录就算之后被删，CLI 也会 -o mkdir 自动重建
+  func chooseOutputDirectory() {
+    let panel = NSOpenPanel()
+    panel.canChooseDirectories = true
+    panel.canChooseFiles = false
+    panel.canCreateDirectories = true
+    panel.directoryURL = Converter.outputDirectory()
+    panel.message = "录制的 GIF 保存到这里"
+    if panel.runModal() == .OK, let url = panel.url {
+      UserDefaults.standard.set(url.path, forKey: Converter.outputDirKey)
+      outputLabel = Self.describeOutputDirectory(url)
+    }
+  }
+
+  /// 目录的菜单显示：桌面写「桌面」，home 下缩成 ~/…，其余显示完整路径
+  private static func describeOutputDirectory(_ url: URL) -> String {
+    let fm = FileManager.default
+    if let desktop = fm.urls(for: .desktopDirectory, in: .userDomainMask).first,
+       url.path == desktop.path { return "桌面" }
+    let home = fm.homeDirectoryForCurrentUser.path
+    if url.path == home { return "~" }
+    if url.path.hasPrefix(home + "/") { return "~" + url.path.dropFirst(home.count) }
+    return url.path
   }
 
   /// 菜单里的「安装缺失依赖」：跑 brew install（进度不透传，只留报错尾巴），
@@ -254,6 +283,7 @@ struct MenuContent: View {
       Button("录制全屏\(hint(.fullscreen))") { model.startFullscreen() }
       Button("框选区域录制…\(hint(.region))") { model.startRegion() }
       Divider()
+      Button("输出位置：\(model.outputLabel)…") { model.chooseOutputDirectory() }
       Button("快捷键设置…") { SettingsWindowController.shared.open() }
       Divider()
       Button("退出") { NSApplication.shared.terminate(nil) }

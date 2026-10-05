@@ -24,6 +24,8 @@
 
 想全局可用：`ln -s ~/Developer/screen2gif/bin/screen2gif /opt/homebrew/bin/screen2gif`，或在 shell 里 `alias s2g='~/Developer/screen2gif/bin/screen2gif'`
 
+输出位置：不传 `-o` 时默认存**当前目录**（`s2g-<时间戳>.gif`）；`-o` 也接受目录（已存在或以 `/` 结尾），自动往里放时间戳文件名，`~/` 前缀会展开。菜单栏 app 默认存桌面，菜单里的「输出位置…」可改。
+
 ## 快速上手
 
 ```sh
@@ -102,7 +104,7 @@ wait
 
 ![菜单栏入口](screenshots/menu.png)
 
-`native/` 里是一个 SwiftUI 菜单栏 app：点图标选「录制全屏」或「框选区域录制…」（屏幕上拖拽，Esc 取消），也可以直接用全局快捷键。开始和结束各有一声提示音（Glass / Tink），圈选录制时选区四周是取景角标（画在选区之外，不会入镜）。录完自动调用本仓库的 CLI 转码并在 Finder 里揭示桌面上的 GIF。采集走 ScreenCaptureKit（`SCRecordingOutput` 直接写 .mov），区域用 `SCStreamConfiguration.sourceRect` 裁（注意它是所选显示器自己的逻辑坐标系）。圈选录制转码时自动加 `--crop off`——圈选已经表达了取景意图，不再做运动区域裁剪；全屏录制保留 `--crop auto`。
+`native/` 里是一个 SwiftUI 菜单栏 app：点图标选「录制全屏」或「框选区域录制…」（屏幕上拖拽，Esc 取消），也可以直接用全局快捷键。开始和结束各有一声提示音（Glass / Tink），圈选录制时选区四周是取景角标（画在选区之外，不会入镜）。录完自动调用本仓库的 CLI 转码并在 Finder 里揭示成品 GIF。GIF 默认存桌面，菜单里的「输出位置…」可换目录（记忆在 UserDefaults，面板里也能新建目录）。采集走 ScreenCaptureKit（`SCRecordingOutput` 直接写 .mov），区域用 `SCStreamConfiguration.sourceRect` 裁（注意它是所选显示器自己的逻辑坐标系）。圈选录制转码时自动加 `--crop off`——圈选已经表达了取景意图，不再做运动区域裁剪；全屏录制保留 `--crop auto`。
 
 ### 录制状态条
 

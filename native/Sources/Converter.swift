@@ -3,6 +3,19 @@ import Foundation
 
 // 转码复用现有 CLI 的关键帧/裁剪/调色板管线，app 只负责采集和交互。
 enum Converter {
+  /// 输出目录的 UserDefaults key；菜单「输出位置…」写、转码读
+  static let outputDirKey = "outputDirectory"
+
+  /// GIF 保存目录：菜单里选过的（UserDefaults），否则桌面。
+  /// 目录被删也不怕——CLI 收到 -o 不存在的目录会 mkdir -p 自动重建。
+  static func outputDirectory() -> URL {
+    if let path = UserDefaults.standard.string(forKey: outputDirKey), !path.isEmpty {
+      return URL(fileURLWithPath: path)
+    }
+    return FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+      ?? FileManager.default.homeDirectoryForCurrentUser
+  }
+
   static func cliURL() -> URL {
     // bundle: <proj>/native/build/screen2gif.app
     Bundle.main.bundleURL
@@ -15,9 +28,8 @@ enum Converter {
   static func convert(mov: URL, regionPicked: Bool, completion: @escaping (Result<URL, Error>) -> Void) {
     let stampFormatter = DateFormatter()
     stampFormatter.dateFormat = "yyyyMMdd-HHmmss"
-    let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
-      ?? FileManager.default.homeDirectoryForCurrentUser
-    let out = desktop.appendingPathComponent("screen2gif-\(stampFormatter.string(from: Date())).gif")
+    let out = outputDirectory()
+      .appendingPathComponent("screen2gif-\(stampFormatter.string(from: Date())).gif")
 
     // CLI 靠 bundle 相对路径定位，app 被挪离 native/build/ 就找不到；
     // 与其报含糊的「文件打不开」，不如把缺失路径说清楚
