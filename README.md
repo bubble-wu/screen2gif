@@ -60,8 +60,9 @@ s2g convert in.mov -o d.gif --crop 200,100,1600,1000
 # 范式一：--then 一条龙（首选）——真正开录后才执行命令，命令退出即停
 s2g record --then 'bash drive-ops.sh' --json -o demo.gif
 
-# 范式二：外部编排——--ready-file 在真正开始采集那一刻才创建，
-# 等它出现再动手，操作不会被倒计时吞掉开头（起跑前先 rm 掉旧信号，避免误读残留）
+# 范式二：外部编排——--ready-file 在 screencapture 拉起那一刻才创建
+# （距实际出画约百毫秒，通常无感），等它出现再动手，操作不会被倒计时吞掉开头
+#（起跑前先 rm 掉旧信号，避免误读残留）
 rm -f /tmp/s2g-ready
 s2g record -d 15 --countdown 0 --ready-file /tmp/s2g-ready -o demo.gif &
 while [ ! -f /tmp/s2g-ready ]; do sleep 0.2; done

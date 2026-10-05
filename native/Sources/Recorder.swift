@@ -125,6 +125,11 @@ final class Recorder: NSObject, SCRecordingOutputDelegate {
         }
       }
     } catch {
+      // 抛错前必须停流：此时 stream 已建、output 已挂，而超时只说明回调迟到——
+      // 采集很可能已在系统侧开跑。不停就走 = 没人收尾，正是 wedged session
+      // 的病因，.mov 还会持续增长。stopCapture 触发的 didFinish 里 outURL
+      // 尚为 nil，不会误回调 onFinished。
+      try? await stream.stopCapture()
       throw RecorderError.startFailed(error)
     }
 

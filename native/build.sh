@@ -19,6 +19,15 @@ VFS="/Users/wububble/Developer/.swift-sdk-fix/vfs.yaml"
 TARGET="arm64-apple-macosx26.2"
 APP="build/screen2gif.app"
 
+# 版本一致性校验：CLI（bin/screen2gif 的 VERSION）是唯一真源，Info.plist 靠手工同步，
+# v1.2/v1.3 就是这样掉队的——构建时挡住，别再靠 review 兜底。
+CLI_VER=$(sed -n "s/^const VERSION = '\(.*\)';/\1/p" ../bin/screen2gif)
+PLIST_VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist 2>/dev/null)
+[ "$CLI_VER" = "$PLIST_VER" ] || {
+  echo "error: 版本不一致 CLI=${CLI_VER} GUI=${PLIST_VER}，请同步 native/Info.plist 的 CFBundleShortVersionString" >&2
+  exit 1
+}
+
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 swiftc -sdk "$SDK" -vfsoverlay "$VFS" -target "$TARGET" \

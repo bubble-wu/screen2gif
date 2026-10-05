@@ -12,7 +12,7 @@ import {
 import { record, frontWindowRegion, checkPermission } from '../lib/record.mjs';
 import { ensureFfmpeg, binWorks, responsibleAppName, openScreenCaptureSettings } from '../lib/deps.mjs';
 
-const VERSION = '1.3.0';
+const VERSION = '1.3.1';
 
 const HELP = `screen2gif ${VERSION} — 录屏 → 关键帧 → 裁剪 → GIF
 

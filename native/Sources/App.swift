@@ -23,6 +23,9 @@ final class Model: ObservableObject {
   private let recorder = Recorder()
   // 圈选已经表达了取景意图，转码时跳过 auto 裁剪，所见即所得
   private var regionPicked = false
+  /// stop() 后等 didFinish 的兜底：采集会话卡死时回调永远不来，
+  /// phase 会停在 converting，菜单回不到可录制状态。自测路径有 20s 超时，正式 UI 也得有。
+  private var stopWatchdog: Task<Void, Never>?
 
   init() {
     recorder.onFinished = { [weak self] mov in
@@ -164,6 +167,13 @@ final class Model: ObservableObject {
     phase = .converting
     statusLine = "收尾中…"
     recorder.stop()
+    // 兜底：stopCapture 后 didFinish 正常百毫秒级就来，30 秒还没到就是会话卡死。
+    // 转码阶段不设超时——时长随录制时长增长，固定值会误杀长录制。
+    stopWatchdog = Task { @MainActor in
+      try? await Task.sleep(nanoseconds: 30_000_000_000)
+      guard !Task.isCancelled else { return }
+      self.fail(StopTimeout())
+    }
   }
 
   private func start(region: CGRect?) {
@@ -202,6 +212,8 @@ final class Model: ObservableObject {
   }
 
   private func handleRecordingFinished(_ mov: URL) {
+    stopWatchdog?.cancel()
+    stopWatchdog = nil
     RecordingOverlay.hide()
     Self.cue("Tink")
     phase = .converting
@@ -226,6 +238,8 @@ final class Model: ObservableObject {
 
   private func fail(_ error: Error) {
     dbg("fail: \(error.localizedDescription)")
+    stopWatchdog?.cancel()
+    stopWatchdog = nil
     RecordingOverlay.hide()
     phase = .idle
     statusLine = error.localizedDescription
@@ -297,6 +311,14 @@ struct MenuContent: View {
     case .converting:
       Text(model.statusLine)
     }
+  }
+}
+
+/// stop() 收尾的兜底错误：SCRecordingOutput 的 didFinish 不来（采集会话卡死）。
+/// 恢复手段与 README 故障排查表一致：killall ControlCenter 或注销重登。
+private struct StopTimeout: LocalizedError {
+  var errorDescription: String? {
+    "停止录制超时（采集会话无响应）。可运行 killall ControlCenter 恢复后重录"
   }
 }
 
