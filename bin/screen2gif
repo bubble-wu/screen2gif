@@ -1,0 +1,322 @@
+#!/usr/bin/env node
+import { mkdtemp, rm, readdir, stat, copyFile, mkdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve, basename, dirname } from 'node:path';
+import {
+  ffmpeg, ffprobe, probe, detectCrop, normalizeCrop, extractKeyframes,
+  applyFrameCap, computeDelays, buildConcatList, encodeGif, SENSITIVITY,
+} from '../lib/video.mjs';
+import { record, frontWindowRegion, checkPermission } from '../lib/record.mjs';
+
+const VERSION = '1.0.0';
+
+const HELP = `screen2gif ${VERSION} — 录屏 → 关键帧 → 裁剪 → GIF
+
+用法:
+  screen2gif record  [选项]              录屏并直接产出 GIF
+  screen2gif convert <视频> [选项]        已有视频转 GIF
+  screen2gif doctor                      检查依赖与屏幕录制权限
+
+输出:
+  -o, --out <路径>        输出 GIF (默认 ./s2g-<时间戳>.gif)
+  -w, --width <px>        输出宽度，0 = 不缩放 (默认 900)
+      --no-palette        跳过调色板两遍编码 (更快，体积更大)
+
+关键帧:
+      --fps <n>           帧率上限，即最小帧间隔 1/n (默认 10)
+      --sensitivity <档>  low | default | high，变化检测灵敏度 (默认 default)
+      --max-frames <n>    关键帧上限，超出则均匀抽稀 (默认 240)
+      --max-gap <秒>      单帧最长停留，长静默被截断 (默认 2.0)
+
+裁剪:
+      --crop <模式>       auto | off | x,y,w,h (默认 auto)
+                          auto = 检测所有关键帧的运动包围盒，裁掉周围静止区域
+      --pad <px>          auto 裁剪后的留白，源视频像素 (默认源宽的 1%)
+
+录制:
+  -d, --duration <秒>     定时录制；省略则按 Enter 手动停止
+  -I, --interactive       用 macOS 原生录屏工具条：立即开始录制，点菜单栏
+                          的停止按钮结束（在任何 App 里都能点）
+      --countdown <秒>    开始前的倒计时 (默认 3，0 = 关闭)
+      --silent            关闭开始/结束提示音
+      --region <模式>     screen | window | x,y,w,h，单位为屏幕点 (默认 screen)
+                          window = 录制启动时的前台窗口
+      --clicks            录制时高亮鼠标点击
+      --display <n>       显示器编号，1 = 主屏
+
+调试:
+      --keep-mov          保留原始录屏到输出目录
+      --keep-frames       保留关键帧 PNG 到输出目录
+      --verbose           打印实际执行的 ffmpeg 命令
+  -q, --quiet             只输出结果
+  -h, --help              显示帮助
+  -V, --version           显示版本`;
+
+function fail(msg) {
+  process.stderr.write(`\n✗ ${msg}\n`);
+  process.exit(1);
+}
+
+function parseArgs(argv) {
+  const o = {
+    cmd: null, input: null, out: null, width: 900, palette: true,
+    fps: 10, sensitivity: 'default', maxFrames: 240, maxGap: 2.0,
+    crop: 'auto', pad: null, duration: null, region: 'screen',
+    clicks: false, display: null, interactive: false, countdown: 3, silent: false,
+    keepMov: false, keepFrames: false,
+    verbose: false, quiet: false,
+  };
+  const num = (flag, v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) fail(`${flag} 需要数字，收到 "${v}"`);
+    return n;
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    const next = () => { const v = argv[++i]; if (v === undefined) fail(`${a} 缺少参数`); return v; };
+    switch (a) {
+      case 'record': case 'convert': case 'doctor':
+        if (o.cmd) fail('只能指定一个子命令'); o.cmd = a; break;
+      case '-o': case '--out': o.out = next(); break;
+      case '-w': case '--width': o.width = Math.max(0, Math.round(num(a, next()))); break;
+      case '--no-palette': o.palette = false; break;
+      case '--fps':
+        o.fps = num(a, next());
+        if (o.fps < 1 || o.fps > 60) fail('--fps 需在 1-60 之间');
+        break;
+      case '--sensitivity':
+        o.sensitivity = next();
+        if (!SENSITIVITY[o.sensitivity]) fail(`--sensitivity 只能是 ${Object.keys(SENSITIVITY).join(' | ')}`);
+        break;
+      case '--max-frames': o.maxFrames = Math.round(num(a, next())); break;
+      case '--max-gap': o.maxGap = num(a, next()); break;
+      case '--crop': o.crop = next(); break;
+      case '--pad': o.pad = Math.round(num(a, next())); break;
+      case '-d': case '--duration': o.duration = num(a, next()); break;
+      case '-I': case '--interactive': o.interactive = true; break;
+      case '--countdown': o.countdown = Math.max(0, Math.round(num(a, next()))); break;
+      case '--silent': o.silent = true; break;
+      case '--region': o.region = next(); break;
+      case '--clicks': o.clicks = true; break;
+      case '--display': o.display = Math.round(num(a, next())); break;
+      case '--keep-mov': o.keepMov = true; break;
+      case '--keep-frames': o.keepFrames = true; break;
+      case '--verbose': o.verbose = true; break;
+      case '-q': case '--quiet': o.quiet = true; break;
+      case '-h': case '--help': process.stdout.write(HELP + '\n'); process.exit(0); break;
+      case '-V': case '--version': process.stdout.write(VERSION + '\n'); process.exit(0); break;
+      default:
+        if (a.startsWith('-')) fail(`未知选项 ${a}（--help 看用法）`);
+        if (o.input) fail(`只能指定一个输入文件，已收到 ${o.input} 和 ${a}`);
+        o.input = a;
+    }
+  }
+  return o;
+}
+
+function parseRect(spec, what) {
+  const parts = spec.split(',').map((s) => Number(s.trim()));
+  if (parts.length !== 4 || parts.some((n) => !Number.isFinite(n))) {
+    fail(`${what} 需要 x,y,w,h 四个数字，收到 "${spec}"`);
+  }
+  const [x, y, w, h] = parts.map(Math.round);
+  if (w < 8 || h < 8) fail(`${what} 的宽高不能小于 8`);
+  return { x: Math.max(0, x), y: Math.max(0, y), w, h };
+}
+
+const listFrames = async (dir) => (await readdir(dir))
+  .filter((f) => f.endsWith('.png'))
+  .sort()
+  .map((f) => join(dir, f));
+
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
+}
+
+async function resolveCrop(input, src, opts, work, pattern, minInterval, log) {
+  if (opts.crop === 'off') { log('  裁剪 off'); return null; }
+  if (opts.crop !== 'auto') {
+    const crop = parseRect(opts.crop, '--crop');
+    if (crop.x + crop.w > src.width || crop.y + crop.h > src.height) {
+      fail(`--crop ${opts.crop} 超出源画面 ${src.width}x${src.height}`);
+    }
+    log(`  裁剪 手动 ${crop.w}x${crop.h}+${crop.x}+${crop.y}`);
+    return crop;
+  }
+
+  const analysisDir = join(work, 'analysis');
+  await mkdir(analysisDir, { recursive: true });
+  const analysisWidth = Math.min(1280, src.width);
+  await extractKeyframes({
+    input, outDir: analysisDir, pattern, crop: null,
+    width: analysisWidth, sensitivity: opts.sensitivity, minInterval,
+    quiet: opts.quiet, label: '分析运动区域', verbose: opts.verbose,
+  });
+  const bbox = await detectCrop(analysisDir, pattern, { verbose: opts.verbose });
+  const pad = opts.pad ?? Math.round(src.width * 0.01);
+  // The bounding box is measured on the downscaled analysis frames, so it has
+  // to be lifted back into source pixels before it can be used as a crop.
+  const k = src.width / analysisWidth;
+  const scaled = bbox && {
+    x: Math.round(bbox.x * k), y: Math.round(bbox.y * k),
+    w: Math.round(bbox.w * k), h: Math.round(bbox.h * k),
+  };
+  const crop = normalizeCrop(scaled, src.width, src.height, pad);
+  log(crop
+    ? `  裁剪 auto ${crop.w}x${crop.h}+${crop.x}+${crop.y} (留白 ${pad}px)`
+    : '  裁剪 auto → 运动覆盖全画面，不裁剪');
+  return crop;
+}
+
+async function convert(input, opts) {
+  const log = (m) => { if (!opts.quiet) process.stderr.write(`${m}\n`); };
+  const src = await probe(input);
+  log(`  源 ${basename(input)}  ${src.width}x${src.height}  ${src.duration.toFixed(1)}s  ${src.nbFrames || '?'} 帧`);
+
+  const work = await mkdtemp(join(tmpdir(), 's2g-'));
+  const pattern = '%05d.png';
+  const minInterval = 1 / opts.fps;
+  try {
+    const crop = await resolveCrop(input, src, opts, work, pattern, minInterval, log);
+    const outWidth = opts.width > 0 ? Math.min(opts.width, crop ? crop.w : src.width) : 0;
+
+    const framesDir = join(work, 'frames');
+    await mkdir(framesDir, { recursive: true });
+    const times = await extractKeyframes({
+      input, outDir: framesDir, pattern, crop, width: outWidth,
+      sensitivity: opts.sensitivity, minInterval,
+      quiet: opts.quiet, label: '提取关键帧', verbose: opts.verbose,
+    });
+    const pngs = await listFrames(framesDir);
+    if (!pngs.length) fail('没有检测到任何画面变化。试试 --sensitivity high，或确认视频确实动过。');
+    if (pngs.length !== times.length) {
+      fail(`关键帧数(${pngs.length})与时间戳数(${times.length})不一致，ffmpeg 行为异常`);
+    }
+
+    const kept = applyFrameCap(times, opts.maxFrames);
+    if (kept.length < times.length) log(`  抽稀 ${times.length} → ${kept.length} 帧 (--max-frames ${opts.maxFrames})`);
+    const frames = kept.map((i) => pngs[i]);
+    const delays = computeDelays(kept.map((i) => times[i]), {
+      minGap: minInterval * 0.9, maxGap: opts.maxGap, endHold: 1.2,
+    });
+
+    const listFile = join(work, 'frames.txt');
+    await buildConcatList(frames, delays, listFile);
+    await encodeGif({
+      listFile, out: opts.out, palette: opts.palette,
+      quiet: opts.quiet, label: '编码 GIF', verbose: opts.verbose,
+    });
+
+    log(`  关键帧 ${frames.length} 帧  GIF 时长 ${(delays.reduce((s, d) => s + d, 0) / 100).toFixed(1)}s`);
+    if (opts.keepFrames) {
+      const dest = join(dirname(resolve(opts.out)), `${basename(opts.out, '.gif')}-frames`);
+      await mkdir(dest, { recursive: true });
+      for (const f of frames) await copyFile(f, join(dest, basename(f)));
+      log(`  关键帧已保留 ${dest}`);
+    }
+  } finally {
+    await rm(work, { recursive: true, force: true });
+  }
+}
+
+function defaultOut() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `s2g-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.gif`;
+}
+
+async function resolveRegion(spec) {
+  if (spec === 'screen') return null;
+  if (spec === 'window') return frontWindowRegion();
+  return parseRect(spec, '--region');
+}
+
+async function cmdRecord(opts) {
+  const log = (m) => { if (!opts.quiet) process.stderr.write(`${m}\n`); };
+  if (opts.interactive && opts.duration) {
+    fail('--interactive 由菜单栏的原生停止按钮决定时长，不能与 -d 同用');
+  }
+  const work = await mkdtemp(join(tmpdir(), 's2g-rec-'));
+  const mov = join(work, 'capture.mov');
+  try {
+    const region = await resolveRegion(opts.region);
+    if (region) log(`  录制区域 ${region.w}x${region.h}+${region.x}+${region.y} (屏幕点)`);
+    const rec = await record({
+      out: mov, duration: opts.duration, clicks: opts.clicks,
+      display: opts.display, region, interactive: opts.interactive,
+      countdown: opts.countdown, silent: opts.silent, quiet: opts.quiet,
+      onEvent: opts.verbose ? (m) => log(`  $ ${m}`) : null,
+    });
+    log(`  录屏完成 ${fmtBytes(rec.bytes)}`);
+    if (opts.keepMov) {
+      const dest = join(dirname(resolve(opts.out)), `${basename(opts.out, '.gif')}.mov`);
+      await copyFile(mov, dest);
+      log(`  原始录屏已保留 ${dest}`);
+    }
+    await convert(mov, opts);
+  } finally {
+    await rm(work, { recursive: true, force: true });
+  }
+}
+
+async function cmdDoctor() {
+  const ok = (b) => (b ? '✓' : '✗');
+  const exists = (p) => stat(p).then(() => true, () => false);
+  let good = true;
+  for (const [name, bin, hint] of [
+    ['ffmpeg', ffmpeg, 'brew install ffmpeg'],
+    ['ffprobe', ffprobe, 'brew install ffmpeg'],
+    ['screencapture', '/usr/sbin/screencapture', '系统自带'],
+  ]) {
+    const found = await exists(bin);
+    process.stdout.write(`${ok(found)} ${name}: ${found ? bin : `未找到 (${hint})`}\n`);
+    if (!found) good = false;
+  }
+  if (good) {
+    process.stdout.write('… 试录 1 秒以检查屏幕录制权限\n');
+    const perm = await checkPermission();
+    process.stdout.write(`${ok(perm.ok)} 屏幕录制权限: ${perm.ok ? `可用 (${perm.width}x${perm.height})` : perm.error}\n`);
+    if (!perm.ok) good = false;
+  }
+  process.stdout.write(good ? '\n一切就绪。\n' : '\n存在问题，见上方 ✗ 项。\n');
+  process.exit(good ? 0 : 1);
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  if (!opts.cmd) {
+    process.stdout.write(HELP + '\n');
+    process.exit(opts.input ? 1 : 0);
+  }
+  if (opts.cmd === 'doctor') return cmdDoctor();
+
+  if (opts.cmd === 'convert') {
+    if (!opts.input) fail('convert 需要一个输入视频文件');
+    if (opts.region !== 'screen') fail('--region 只在 record 时有效；convert 请用 --crop 指定裁剪区域');
+    opts.input = resolve(opts.input);
+    await stat(opts.input).catch(() => fail(`找不到输入文件 ${opts.input}`));
+  } else if (opts.input) {
+    fail('record 不接受输入文件；要转已有视频请用 convert <文件>');
+  }
+
+  opts.out = resolve(opts.out || defaultOut());
+  await mkdir(dirname(opts.out), { recursive: true });
+
+  const started = Date.now();
+  if (opts.cmd === 'record') await cmdRecord(opts);
+  else await convert(opts.input, opts);
+
+  if (opts.quiet) {
+    process.stdout.write(`${opts.out}\n`);
+  } else {
+    const st = await stat(opts.out);
+    process.stderr.write(`\n✓ ${opts.out}\n  ${fmtBytes(st.size)}  用时 ${((Date.now() - started) / 1000).toFixed(1)}s\n`);
+  }
+}
+
+main().catch((err) => {
+  process.stderr.write(`\r${' '.repeat(100)}\r`);
+  fail(err.message || String(err));
+});
