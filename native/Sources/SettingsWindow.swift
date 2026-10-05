@@ -12,7 +12,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
   func open() {
     if window == nil {
       let content = ShortcutsSettingsView()
-        .frame(width: 380)
+        .frame(width: 340)
       let host = NSHostingView(rootView: content)
       let w = NSWindow(
         contentRect: NSRect(origin: .zero, size: host.fittingSize),
@@ -54,21 +54,24 @@ struct ShortcutsSettingsView: View {
         ForEach(HotKeyAction.allCases) { action in
           HStack {
             Text(action.title)
-              .frame(width: 110, alignment: .leading)
+            Spacer()
             ShortcutRecorderField(combo: store.combos[action] ?? nil) {
               store.setCombo($0, for: action)
             }
-            Spacer()
+            .frame(width: 110, height: 24)
           }
         }
       }
 
       Divider()
 
-      Text("快捷键在所有应用里都生效。点击右侧按钮后按下新组合键（需含 ⌘/⌃/⌥ 之一）；按 ⌫ 禁用该快捷键，Esc 取消录入。若与其他应用的快捷键冲突会注册失败，换个组合即可。")
-        .font(.footnote)
-        .foregroundStyle(.secondary)
-        .fixedSize(horizontal: false, vertical: true)
+      VStack(alignment: .leading, spacing: 4) {
+        Text("点击右侧按钮后按下新组合键（需含 ⌘/⌃/⌥ 之一）；按 ⌫ 禁用，Esc 取消。")
+        Text("与其他应用冲突时会注册失败，换个组合即可。")
+      }
+      .font(.footnote)
+      .foregroundStyle(.secondary)
+      .fixedSize(horizontal: false, vertical: true)
 
       HStack {
         Spacer()
