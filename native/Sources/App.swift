@@ -70,23 +70,22 @@ final class Model: ObservableObject {
   private func start(region: CGRect?) {
     let mov = FileManager.default.temporaryDirectory
       .appendingPathComponent("s2g-\(UUID().uuidString).mov")
-    // 先把状态条挂出来：Recorder 要拿它的窗口从采集里剔除（全屏时不这么做会入镜）
-    let overlayWindows = RecordingOverlay.show(region: region) { [weak self] in
-      self?.stop()
-    }
+    // 先把 overlay 挂出来：Recorder 要拿它的窗口从采集里剔除（全屏时不这么做会入镜）
+    let overlayWindows = RecordingOverlay.show(
+      region: region,
+      onStop: { [weak self] in self?.stop() },
+      // 框选：对焦动画完成（画面清晰）时播 Glass——「清晰了 = 开始了」
+      onFocused: { [weak self] in
+        guard let self, self.phase == .recording else { return }
+        Self.cue("Glass")
+      })
     do {
       try recorder.start(region: region, to: mov, excluding: overlayWindows)
       regionPicked = (region != nil)
       phase = .recording
       statusLine = ""
       needsPermission = false
-      if region != nil {
-        // 框选有对焦动画：角标收拢完成（≈0.44s）再播 Glass，音画同步「清晰=开始」
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.44) { [weak self] in
-          guard let self, self.phase == .recording else { return }
-          Self.cue("Glass")
-        }
-      } else {
+      if region == nil {
         Self.cue("Glass")
       }
     } catch {
@@ -192,6 +191,10 @@ struct Screen2GifApp: App {
       Self.runSelfTest(seconds: seconds, region: Self.selfTestRect())
       exit(0)
     }
+    if let rect = Self.focusTestRect() {
+      Self.runFocusTest(rect: rect)
+      exit(0)
+    }
   }
 
   var body: some Scene {
@@ -208,6 +211,30 @@ struct Screen2GifApp: App {
     let args = CommandLine.arguments
     guard let i = args.firstIndex(of: "--capture-test"), i + 1 < args.count else { return nil }
     return Double(args[i + 1])
+  }
+
+  // --focus-test x,y,w,h：只挂 overlay 跑对焦动画（不含采集），
+  // 用来无鼠标地验证虚化开场与角标渲染
+  private static func focusTestRect() -> CGRect? {
+    let args = CommandLine.arguments
+    guard let i = args.firstIndex(of: "--focus-test"), i + 1 < args.count else { return nil }
+    let parts = args[i + 1].split(separator: ",").compactMap { Double($0) }
+    guard parts.count == 4 else { return nil }
+    return CGRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3])
+  }
+
+  private static func runFocusTest(rect: CGRect) {
+    _ = NSApplication.shared
+    _ = RecordingOverlay.show(
+      region: rect,
+      onStop: {},
+      onFocused: { dbg("focused") })
+    // 动画靠主 runloop 驱动，不能 Thread.sleep 卡死
+    let end = Date().addingTimeInterval(2.0)
+    while Date() < end {
+      RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    }
+    RecordingOverlay.hide()
   }
 
   private static func selfTestRect() -> CGRect? {

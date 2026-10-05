@@ -1,4 +1,5 @@
 import AppKit
+import ScreenCaptureKit
 import SwiftUI
 
 // 录制中的可视指示，全屏与框选共用同一套：
@@ -16,8 +17,9 @@ enum RecordingOverlay {
     private static var barPanel: NSPanel?
 
     /// 返回所有 overlay 窗口：Recorder 拿去从采集里剔除（excludingWindows）。
+    /// onFocused：框选对焦动画完成（画面清晰 = 录制开始）时回调，用于播放提示音。
     @discardableResult
-    static func show(region: CGRect?, onStop: @escaping () -> Void) -> [NSWindow] {
+    static func show(region: CGRect?, onStop: @escaping () -> Void, onFocused: @escaping () -> Void) -> [NSWindow] {
         hide()
         var windows: [NSWindow] = []
 
@@ -39,10 +41,23 @@ enum RecordingOverlay {
             w.hasShadow = false
             w.ignoresMouseEvents = true
             w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-            w.contentView = BorderView(regionSize: region.size)
+            let borderView = BorderView(regionSize: region.size)
+            w.contentView = borderView
             w.orderFrontRegardless()
             borderWindow = w
             windows.append(w)
+
+            // 对焦开场 = 选区内容虚化→清晰 + 角标收拢，两者要同步开始，
+            // 所以等快照抓好了才 beginFocus（此刻 overlay 已上屏，
+            // 抓图时把自己排除，避免把角标冻进快照）
+            Task { @MainActor in
+                let snap = await Self.captureRegion(region, excluding: w)
+                borderView.beginFocus(snapshot: snap, onFocused: onFocused)
+            }
+            // 抓图卡死时的兜底：到点强制开场（只有角标收拢，无虚化）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                borderView.beginFocus(snapshot: nil, onFocused: onFocused)
+            }
         }
 
         // 状态条：先量尺寸再定位
@@ -95,6 +110,47 @@ enum RecordingOverlay {
         barPanel?.orderOut(nil)
         barPanel = nil
     }
+
+    /// 抓取选区当前画面（CG 坐标，主屏）。失败返回 nil，调用方跳过虚化开场。
+    /// CGWindowListCreateImage / CGDisplayCreateImage 在 macOS 26 SDK 均
+    /// unavailable，只能走 SCScreenshotManager（异步）。
+    @MainActor
+    private static func captureRegion(_ region: CGRect, excluding excluded: NSWindow) async -> CGImage? {
+        guard let screen = NSScreen.screens.first else { return nil }
+        let rect = region.intersection(CGRect(origin: .zero, size: screen.frame.size))
+        guard !rect.isNull, rect.width > 8, rect.height > 8 else { return nil }
+        do {
+            let content = try await SCShareableContent.current
+            let display = content.displays.first { $0.frame.origin == .zero }
+                ?? content.displays.first
+            guard let display else { return nil }
+            // overlay 已上屏，不把自己排除就会把角标冻进快照
+            let excludedSC = content.windows.filter { $0.windowID == excluded.windowNumber }
+            let filter = SCContentFilter(display: display, excludingWindows: excludedSC)
+
+            // 这里的 captureImage 收 SCStreamConfiguration（与 Recorder 同一套数学）：
+            // sourceRect 是所选显示器自己的逻辑坐标系，width/height 是输出像素
+            let config = SCStreamConfiguration()
+            config.sourceRect = CGRect(
+                x: rect.minX - display.frame.minX,
+                y: rect.minY - display.frame.minY,
+                width: rect.width, height: rect.height)
+            let scale: CGFloat
+            if let mode = CGDisplayCopyDisplayMode(display.displayID) {
+                scale = CGFloat(mode.pixelWidth) / display.frame.width
+            } else {
+                scale = CGFloat(display.width) / display.frame.width
+            }
+            config.width = Int((rect.width * scale).rounded())
+            config.height = Int((rect.height * scale).rounded())
+            config.capturesAudio = false
+            config.showsCursor = false
+            return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+        } catch {
+            dbg("focus snapshot failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
 }
 
 /// 红框窗口：透明、不抢事件
@@ -110,12 +166,29 @@ private final class StatusBarPanel: NSPanel {
 private final class BorderView: NSView {
     private let regionSize: CGSize
 
+    private var began = false
+
     init(regionSize: CGSize) {
         self.regionSize = regionSize
         super.init(frame: NSRect(
             origin: .zero,
             size: CGSize(width: regionSize.width + 56, height: regionSize.height + 56)))
+    }
+
+    /// 对焦开场：虚化层 + 角标收拢同步启动（等快照就绪才调用，保证音画对齐）。
+    /// 幂等：快照任务与兜底定时器谁先到谁生效。
+    func beginFocus(snapshot: CGImage?, onFocused: @escaping () -> Void) {
+        guard !began else { return }
+        began = true
+        if let snapshot {
+            let focus = FocusBlurView(snapshot: snapshot)
+            focus.frame = regionRect
+            addSubview(focus)
+            focus.start()
+        }
         setupCorners()
+        // 对焦完成（≈0.44s：虚化拉清 0.42 + 闪烁）：提示音时机交给调用方
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.44) { onFocused() }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -225,6 +298,93 @@ private final class CornerMarkView: NSView {
         path.lineWidth = 2
         NSColor(calibratedWhite: 0.24, alpha: 1).setStroke()
         path.stroke()
+    }
+}
+
+/// 对焦开场：选区内容先虚化再拉清晰（相机对焦语义）。
+/// 快照来自 overlay 上屏前的屏幕抓图；高斯模糊半径随时间收敛到 0，
+/// 结束后移除视图、露出真实内容。本窗口已被采集过滤剔除，
+/// 这段动画只给用户看，不会录进成片。
+private final class FocusBlurView: NSView {
+    private let snapshot: CGImage
+    private let ciImage: CIImage
+    private let ciContext = CIContext()
+    private var timer: Timer?
+    private let duration: TimeInterval = 0.42
+    private let maxSigma: Double = 14
+    private let startTime = CACurrentMediaTime()
+
+    init(snapshot: CGImage) {
+        self.snapshot = snapshot
+        self.ciImage = CIImage(cgImage: snapshot)
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.contents = snapshot
+        layer?.contentsGravity = .resize
+        layer?.masksToBounds = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    deinit {
+        timer?.invalidate()
+    }
+
+    func start() {
+        // 轻微缩放呼吸（1.03 → 1）增强镜头感；只动 presentation，不动模型
+        let scale = CABasicAnimation(keyPath: "transform.scale")
+        scale.fromValue = 1.03
+        scale.toValue = 1.0
+        scale.duration = duration
+        scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer?.add(scale, forKey: "focusScale")
+
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] t in
+            guard let self else { t.invalidate(); return }
+            self.tick()
+        }
+    }
+
+    private func tick() {
+        // 窗口已被收起（极短的录制）就直接收工
+        guard window != nil else { finish(); return }
+        let p = min(1.0, (CACurrentMediaTime() - startTime) / duration)
+        if p >= 1.0 {
+            finish()
+            return
+        }
+        // easeOutCubic：锐度快速跟上，虚化尾巴缓收
+        let sigma = maxSigma * pow(1 - p, 3)
+        renderAsync(sigma: sigma)
+    }
+
+    private func renderAsync(sigma: Double) {
+        let image = ciImage
+        let context = ciContext
+        let extent = ciImage.extent
+        let sharp = snapshot
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+            let output: CGImage
+            if sigma < 0.4 {
+                output = sharp
+            } else {
+                // AffineClamp 把四周无限延伸，blur 才不会把边缘虚成透明
+                let clamp = CIFilter(name: "CIAffineClamp")!
+                clamp.setValue(image, forKey: kCIInputImageKey)
+                let blur = CIFilter(name: "CIGaussianBlur")!
+                blur.setValue(clamp.outputImage, forKey: kCIInputImageKey)
+                blur.setValue(sigma, forKey: "inputRadius")
+                output = context.createCGImage(
+                    blur.outputImage!.cropped(to: extent), from: extent)!
+            }
+            DispatchQueue.main.async { self?.layer?.contents = output }
+        }
+    }
+
+    private func finish() {
+        timer?.invalidate()
+        timer = nil
+        removeFromSuperview()
     }
 }
 
