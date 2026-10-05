@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import Foundation
 import ScreenCaptureKit
@@ -33,13 +34,17 @@ final class Recorder: NSObject, SCRecordingOutputDelegate {
   private var outURL: URL?
 
   // region 为 CG 坐标（点，左上原点）；nil = 整屏
-  func start(region: CGRect?, to url: URL) throws {
+  // excluding：要从画面里剔除的窗口（录制状态条等 UI），按 windowNumber 匹配
+  func start(region: CGRect?, to url: URL, excluding excluded: [NSWindow] = []) throws {
     let sem = DispatchSemaphore(value: 0)
     var displays: [SCDisplay] = []
+    var allWindows: [SCWindow] = []
     var queryError: Error?
     Task {
       do {
-        displays = try await SCShareableContent.current.displays
+        let content = try await SCShareableContent.current
+        displays = content.displays
+        allWindows = content.windows
       } catch {
         queryError = error
       }
@@ -82,7 +87,15 @@ final class Recorder: NSObject, SCRecordingOutputDelegate {
     // 按面板原生分辨率采集再缩放到 width/height；没有它 .auto 可能按 1x 采再放大
     config.captureResolution = .best
 
-    let filter = SCContentFilter(display: display, excludingWindows: [])
+    // 全屏录制时状态条在画面内，必须从采集里剔除；
+    // 框选时状态条在选区外本来就不入镜，剔除只是双保险。
+    let excludedSC = allWindows.filter { sc in
+      excluded.contains { $0.windowNumber == sc.windowID }
+    }
+    if excludedSC.count < excluded.count {
+      dbg("warning: \(excluded.count - excludedSC.count) 个 overlay 窗口没匹配到 SCWindow，可能被录进成片")
+    }
+    let filter = SCContentFilter(display: display, excludingWindows: excludedSC)
     let stream = SCStream(filter: filter, configuration: config, delegate: nil)
 
     let outputConfig = SCRecordingOutputConfiguration()

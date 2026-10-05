@@ -24,11 +24,28 @@ final class Model: ObservableObject {
     recorder.onFailed = { [weak self] error in
       DispatchQueue.main.async { self?.fail(error) }
     }
+
+    // 全局快捷键（可在「快捷键设置…」里改）
+    ShortcutStore.shared.registerAll()
+    HotKeyCenter.shared.onAction = { [weak self] action in
+      DispatchQueue.main.async {
+        guard let self else { return }
+        switch action {
+        case .fullscreen: self.startFullscreen()
+        case .region: self.startRegion()
+        case .stop: self.stop()
+        }
+      }
+    }
   }
 
-  func startFullscreen() { start(region: nil) }
+  func startFullscreen() {
+    guard phase == .idle else { return }
+    start(region: nil)
+  }
 
   func startRegion() {
+    guard phase == .idle else { return }
     phase = .picking
     RegionPicker.pick { [weak self] rect in
       DispatchQueue.main.async {
@@ -53,15 +70,19 @@ final class Model: ObservableObject {
   private func start(region: CGRect?) {
     let mov = FileManager.default.temporaryDirectory
       .appendingPathComponent("s2g-\(UUID().uuidString).mov")
+    // 先把状态条挂出来：Recorder 要拿它的窗口从采集里剔除（全屏时不这么做会入镜）
+    let overlayWindows = RecordingOverlay.show(region: region) { [weak self] in
+      self?.stop()
+    }
     do {
-      try recorder.start(region: region, to: mov)
+      try recorder.start(region: region, to: mov, excluding: overlayWindows)
       regionPicked = (region != nil)
       phase = .recording
       statusLine = ""
       needsPermission = false
-      RecordingOverlay.show(region: region)
       Self.cue("Glass")
     } catch {
+      RecordingOverlay.hide()
       fail(error)
     }
   }
@@ -121,6 +142,13 @@ final class Model: ObservableObject {
 
 struct MenuContent: View {
   @EnvironmentObject var model: Model
+  @ObservedObject private var shortcuts = ShortcutStore.shared
+
+  /// 菜单里展示快捷键提示（如 "⌘⇧6"）；被禁用则不显示
+  private func hint(_ action: HotKeyAction) -> String {
+    guard let combo = shortcuts.combos[action] ?? nil else { return "" }
+    return "  " + combo.label
+  }
 
   var body: some View {
     switch model.phase {
@@ -130,15 +158,17 @@ struct MenuContent: View {
         Button("打开屏幕录制设置…") { model.openScreenCaptureSettings() }
       }
       Divider()
-      Button("录制全屏") { model.startFullscreen() }
-      Button("框选区域录制…") { model.startRegion() }
+      Button("录制全屏\(hint(.fullscreen))") { model.startFullscreen() }
+      Button("框选区域录制…\(hint(.region))") { model.startRegion() }
+      Divider()
+      Button("快捷键设置…") { SettingsWindowController.shared.open() }
       Divider()
       Button("退出") { NSApplication.shared.terminate(nil) }
     case .picking:
       Text("在屏幕上拖拽框选…（Esc 取消）")
     case .recording:
-      Text("● 录制中")
-      Button("停止录制并转码") { model.stop() }
+      Text("● 录制中 · 状态条可直接停止")
+      Button("停止录制并转码\(hint(.stop))") { model.stop() }
     case .converting:
       Text(model.statusLine)
     }

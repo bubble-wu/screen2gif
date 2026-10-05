@@ -76,7 +76,21 @@ s2g convert in.mov -o d.gif --crop 200,100,1600,1000
 
 ## 原生菜单栏 app（人在电脑前时更好用）
 
-`native/` 里是一个 SwiftUI 菜单栏 app：点图标选「录制全屏」或「框选区域录制…」（屏幕上拖拽，Esc 取消）。开始和结束各有一声提示音（Glass / Tink），圈选录制时选区外会出现红框 + REC 标记（画在选区之外，不会入镜），录完点「停止录制并转码」，自动调用本仓库的 CLI 转码并在 Finder 里揭示桌面上的 GIF。采集走 ScreenCaptureKit（`SCRecordingOutput` 直接写 .mov），区域用 `SCStreamConfiguration.sourceRect` 裁（注意它是所选显示器自己的逻辑坐标系）。圈选录制转码时自动加 `--crop off`——圈选已经表达了取景意图，不再做运动区域裁剪；全屏录制保留 `--crop auto`。
+`native/` 里是一个 SwiftUI 菜单栏 app：点图标选「录制全屏」或「框选区域录制…」（屏幕上拖拽，Esc 取消），也可以直接用全局快捷键。开始和结束各有一声提示音（Glass / Tink），圈选录制时选区外会出现红框（画在选区之外，不会入镜）。录完自动调用本仓库的 CLI 转码并在 Finder 里揭示桌面上的 GIF。采集走 ScreenCaptureKit（`SCRecordingOutput` 直接写 .mov），区域用 `SCStreamConfiguration.sourceRect` 裁（注意它是所选显示器自己的逻辑坐标系）。圈选录制转码时自动加 `--crop off`——圈选已经表达了取景意图，不再做运动区域裁剪；全屏录制保留 `--crop auto`。
+
+### 录制状态条
+
+录制中屏幕顶部会出现一条深色胶囊状态条（全屏和框选共用同一套）：红色 REC 圆点每秒闪烁、等宽数字计时、右侧「停止」按钮点一下即停——不用再去找菜单栏图标。它对鼠标点击生效但**不抢焦点**（nonactivating panel），点停止不会把正在演示的应用晃出去。框选时状态条在选区正上方（选区外，天然不入镜；选区贴屏幕顶时移入选区内）；全屏时在主屏顶部菜单栏下方，靠 `SCContentFilter(excludingWindows:)` 从采集里剔除，**不会被录进成片**。
+
+### 全局快捷键
+
+| 动作 | 默认 | 可改 |
+|---|---|---|
+| 录制全屏 | ⇧⌘6 | 菜单 → 快捷键设置… |
+| 框选区域录制 | ⇧⌘7 | 同上 |
+| 停止录制 | ⇧⌘8 | 同上 |
+
+默认排在系统截屏键 ⇧⌘5 后面。设置窗口里点击条目即可录入新组合（需含 ⌘/⌃/⌥ 之一，⌫ 禁用，Esc 取消），改完即存即生效，无需重启。实现走 Carbon `RegisterEventHotKey`（系统级热键，无需辅助功能权限）；冲突时注册失败，换个组合即可。
 
 ```sh
 cd native && ./build.sh && open build/screen2gif.app
