@@ -3,50 +3,45 @@ import Foundation
 
 // 转码复用现有 CLI 的关键帧/裁剪/调色板管线，app 只负责采集和交互。
 enum Converter {
-  /// 输出目录的 UserDefaults key；菜单「输出位置…」写、转码读
-  static let outputDirKey = "outputDirectory"
-
-  /// GIF 保存目录：菜单里选过的（UserDefaults），否则桌面。
-  /// 目录被删也不怕——CLI 收到 -o 不存在的目录会 mkdir -p 自动重建。
-  static func outputDirectory() -> URL {
-    if let path = UserDefaults.standard.string(forKey: outputDirKey), !path.isEmpty {
-      return URL(fileURLWithPath: path)
-    }
-    return FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
-      ?? FileManager.default.homeDirectoryForCurrentUser
-  }
-
   static func cliURL() -> URL {
-    // bundle: <proj>/native/build/screen2gif.app
-    Bundle.main.bundleURL
-      .deletingLastPathComponent()
-      .deletingLastPathComponent()
-      .deletingLastPathComponent()
-      .appendingPathComponent("bin/screen2gif")
+    Bundle.main.resourceURL!
+      .appendingPathComponent("cli/bin/screen2gif")
   }
 
-  static func convert(mov: URL, regionPicked: Bool, completion: @escaping (Result<URL, Error>) -> Void) {
+  static func convert(mov: URL, regionPicked: Bool, settings: ExportSettings, completion: @escaping (Result<URL, Error>) -> Void) {
     let stampFormatter = DateFormatter()
     stampFormatter.dateFormat = "yyyyMMdd-HHmmss"
-    let out = outputDirectory()
-      .appendingPathComponent("screen2gif-\(stampFormatter.string(from: Date())).gif")
+    let out = settings.directory
+      .appendingPathComponent("screen2gif-\(stampFormatter.string(from: Date()))-\(UUID().uuidString.prefix(6)).gif")
 
-    // CLI 靠 bundle 相对路径定位，app 被挪离 native/build/ 就找不到；
-    // 与其报含糊的「文件打不开」，不如把缺失路径说清楚
+    // The build embeds the full CLI; a missing file means an incomplete bundle.
     let cli = cliURL()
     guard FileManager.default.isExecutableFile(atPath: cli.path) else {
       completion(.failure(NSError(
         domain: "screen2gif", code: 2,
         userInfo: [NSLocalizedDescriptionKey:
-          "找不到转码 CLI：\(cli.path)。app 需在 native/build/ 原位运行，或自行放置 bin/screen2gif"])))
+          "找不到转码 CLI：\(cli.path)。应用资源不完整，请重新运行 native/build.sh"])))
+      return
+    }
+
+    let watermarkURL: URL?
+    do {
+      if let text = settings.effectiveWatermarkText {
+        let url = FileManager.default.temporaryDirectory
+          .appendingPathComponent("s2g-watermark-\(UUID().uuidString).png")
+        try TextWatermark.png(text).write(to: url, options: .atomic)
+        watermarkURL = url
+      } else { watermarkURL = nil }
+    } catch {
+      completion(.failure(error))
       return
     }
 
     let process = Process()
     process.executableURL = cli
     // 圈选录制时用户已经框定取景，禁用 auto 裁剪，避免成片被裁到只剩运动区域
-    process.arguments = ["convert", mov.path, "-o", out.path]
-      + (regionPicked ? ["--crop", "off"] : [])
+    process.arguments = settings.arguments(input: mov, output: out, regionPicked: regionPicked)
+    if let watermarkURL { process.arguments! += ["--watermark-overlay", watermarkURL.path] }
     var env = ProcessInfo.processInfo.environment
     env["PATH"] = searchPATH()
     process.environment = env
@@ -62,6 +57,7 @@ enum Converter {
     DispatchQueue.global().asyncAfter(deadline: .now() + 600, execute: watchdog)
     process.terminationHandler = { proc in
       watchdog.cancel()
+      if let watermarkURL { try? FileManager.default.removeItem(at: watermarkURL) }
       let errText = String(
         data: errPipe.fileHandleForReading.readDataToEndOfFile(),
         encoding: .utf8) ?? ""
@@ -82,6 +78,8 @@ enum Converter {
     do {
       try process.run()
     } catch {
+      watchdog.cancel()
+      if let watermarkURL { try? FileManager.default.removeItem(at: watermarkURL) }
       completion(.failure(error))
     }
   }

@@ -15,6 +15,7 @@ import SwiftUI
 enum RecordingOverlay {
     private static var borderWindow: NSWindow?
     private static var barPanel: NSPanel?
+    private static var barState: RecordingBarState?
 
     /// 返回所有 overlay 窗口：Recorder 拿去从采集里剔除（excludingWindows）。
     /// onFocused：框选对焦动画完成（画面清晰 = 录制开始）时回调，用于播放提示音。
@@ -53,8 +54,9 @@ enum RecordingOverlay {
         }
 
         // 状态条：先量尺寸再定位
-        let startedAt = Date()
-        let host = NSHostingView(rootView: StatusBarView(startedAt: startedAt, onStop: onStop))
+        let state = RecordingBarState()
+        barState = state
+        let host = NSHostingView(rootView: StatusBarView(state: state, onStop: onStop))
         let size = host.fittingSize
         host.setFrameSize(size)
         let panel = StatusBarPanel(
@@ -112,7 +114,12 @@ enum RecordingOverlay {
         return windows
     }
 
+    static func markRecording(startedAt: Date) {
+        barState?.startedAt = startedAt
+    }
+
     static func hide() {
+        barState = nil
         borderWindow?.orderOut(nil)
         borderWindow = nil
         barPanel?.orderOut(nil)
@@ -420,26 +427,30 @@ private final class FocusBlurView: NSView {
 
 /// 状态条本体：深色胶囊，红点每秒闪一下，等宽数字计时，右侧停止按钮。
 /// TimelineView 每秒重绘驱动计时（顺带驱动红点闪烁），不需要外部 Timer。
+private final class RecordingBarState: ObservableObject {
+    @Published var startedAt: Date?
+}
+
 private struct StatusBarView: View {
-    let startedAt: Date
+    @ObservedObject var state: RecordingBarState
     let onStop: () -> Void
 
     var body: some View {
-        TimelineView(.periodic(from: startedAt, by: 1)) { context in
-            let seconds = max(0, Int(context.date.timeIntervalSince(startedAt).rounded(.down)))
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let seconds = max(0, Int(context.date.timeIntervalSince(state.startedAt ?? context.date).rounded(.down)))
             HStack(spacing: 10) {
                 Circle()
-                    .fill(Color.red)
+                    .fill(state.startedAt == nil ? Color.orange : Color.red)
                     .frame(width: 8, height: 8)
                     .opacity(seconds % 2 == 0 ? 1 : 0.35)
-                Text("REC \(Self.elapsed(seconds))")
+                Text(state.startedAt == nil ? "准备录制…" : "REC \(Self.elapsed(seconds))")
                     .font(.system(size: 13, weight: .semibold, design: .monospaced))
                     .foregroundStyle(.white)
                     .fixedSize()
                 Button(action: onStop) {
                     HStack(spacing: 4) {
                         Image(systemName: "stop.fill")
-                        Text("停止")
+                        Text(state.startedAt == nil ? "取消" : "停止")
                     }
                     .font(.system(size: 12, weight: .semibold))
                     .padding(.horizontal, 10)
@@ -450,6 +461,7 @@ private struct StatusBarView: View {
                 }
                 .buttonStyle(.plain)
             }
+            .frame(minWidth: 205)
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
             .background(Capsule().fill(Color.black.opacity(0.75)))

@@ -9,7 +9,7 @@ description: 录制 macOS 屏幕操作并产出精简 GIF：自动抽取关键�
 
 CLI 位置：`~/Developer/screen2gif/bin/screen2gif`（下称 `s2g`）。依赖 ffmpeg 与系统自带 `screencapture`；缺 ffmpeg 时交互终端里 CLI 会询问并代装，非交互（agent）则直接报错提示 `brew install ffmpeg`。
 
-用户在电脑前想自己点着录时，另有菜单栏 app（`native/`，用法见 README）；**agent 一律走 CLI**，因为 app 需要人手动授权且靠鼠标点菜单。
+用户在电脑前想自己点着录时，另有菜单栏 app（`native/`，用法见 README）。app 的「设置…」统一配置输出文件夹、画质、快捷键、提示音和导出后显示文件；画质默认均衡（1440 px），文字演示可选清晰优先（原始像素）。这些偏好仅影响 app，不改变 CLI 默认参数；**agent 一律走 CLI**，因为 app 需要人手动授权且靠鼠标点菜单。
 
 ## 何时用
 
@@ -69,7 +69,7 @@ wait                                                                          # 
 
 - 时长宁长勿短：静止画面会被关键帧抽取和 `--max-gap` 压掉，多录不亏，只是转码稍慢。
 - `--region window` 在录制启动时解析前台窗口；命令会切换焦点的话，用固定 `--region x,y,w,h` 更稳。
-- 成功后取结果：加 `--json`，stdout 输出单行 JSON（`gif` 路径 / `bytes` / `frames` / `gifDuration` / `crop` / `elapsed`，`--then` 时含 `commandExit`），不用解析人话日志。
+- 成功后取结果：加 `--json`，stdout 输出单行 JSON（`gif` 路径 / `bytes` / `frames` / `keyframes` / `gifDuration` / `crop` / `elapsed`，`--then` 时含 `commandExit`），不用解析人话日志；`frames`/`gifDuration` 来自编码后成品，`keyframes` 为逻辑关键帧数。`--json`/`-q` 下子命令输出转到 stderr。
 
 ## 常用参数
 
@@ -84,12 +84,12 @@ wait                                                                          # 
 | `--countdown` | 开始前倒计时秒数（0 = 直接开始） | 3 |
 | `--silent` | 关闭提示音 | 关 |
 | `--json` | 成功时 stdout 输出单行 JSON 结果 | 关 |
-| `--fps` | 关键帧率上限 | 10 |
+| `--fps` | 关键播放帧率上限，保留最终状态 | 10 |
 | `--sensitivity` | 变化检测灵敏度 `low/default/high` | default |
 | `--crop` | `auto` / `off` / `x,y,w,h` | auto |
 | `--region` | 录制范围 `screen` / `window` / `x,y,w,h`（屏幕点） | screen |
 | `--clicks` | 高亮鼠标点击 | 关 |
-| `--max-frames` | 关键帧上限，超出均匀抽稀 | 240 |
+| `--max-frames` | 关键帧上限，抽稀保留首尾；1 则保留最终状态 | 240 |
 | `--keep-frames` | 保留关键帧 PNG 供检查 | 关 |
 | `-q` | 只输出结果路径（便于脚本取用） | 关 |
 

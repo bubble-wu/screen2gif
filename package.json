@@ -1,5 +1,9 @@
 {
   "name": "screen2gif",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "test:native": "sh native/test.sh"
+  }
 }

@@ -140,19 +140,24 @@ final class HotKeyCenter {
 /// 快捷键配置的读写与注册。combos 的 value 是 Optional：nil = 用户显式禁用。
 final class ShortcutStore: ObservableObject {
   static let shared = ShortcutStore()
+  private let storage: PreferencesStorage
+  private let registersGlobally: Bool
 
   @Published private(set) var combos: [HotKeyAction: KeyCombo?] = [:]
   /// 注册失败（通常是组合被其他应用占用）的动作，菜单/设置里提示用户
   @Published private(set) var conflicts: Set<HotKeyAction> = []
 
-  private init() {
+  init(storage: PreferencesStorage = UserDefaults.standard, registersGlobally: Bool = true) {
+    self.storage = storage
+    self.registersGlobally = registersGlobally
     for action in HotKeyAction.allCases {
-      combos[action] = Self.load(action)
+      combos[action] = Self.load(action, storage: storage)
     }
   }
 
   /// 启动时（或恢复默认后）按当前配置注册全部热键
   func registerAll() {
+    guard registersGlobally else { return }
     var failed: Set<HotKeyAction> = []
     for (action, combo) in combos {
       if let combo {
@@ -183,7 +188,7 @@ final class ShortcutStore: ObservableObject {
   // MARK: - UserDefaults
 
   private func persist() {
-    let defaults = UserDefaults.standard
+    let defaults = storage
     for (action, combo) in combos {
       let key = "hotkey.\(action.rawValue)"
       if let combo {
@@ -197,16 +202,15 @@ final class ShortcutStore: ObservableObject {
     }
   }
 
-  private static func load(_ action: HotKeyAction) -> KeyCombo? {
-    let defaults = UserDefaults.standard
+  private static func load(_ action: HotKeyAction, storage defaults: PreferencesStorage) -> KeyCombo? {
     let key = "hotkey.\(action.rawValue)"
     guard defaults.object(forKey: key + ".key") != nil else {
       return action.defaultCombo
     }
-    let keyCode = defaults.integer(forKey: key + ".key")
+    let keyCode = defaults.object(forKey: key + ".key") as? Int ?? 0
     if keyCode < 0 { return nil }
     let modsRaw = defaults.object(forKey: key + ".mods") as? UInt
-    let display = defaults.string(forKey: key + ".display")
+    let display = defaults.object(forKey: key + ".display") as? String
       ?? defaultDisplay(forKeyCode: UInt32(max(0, keyCode)))
     return KeyCombo(
       keyCode: UInt32(max(0, keyCode)),

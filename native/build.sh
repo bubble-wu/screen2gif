@@ -26,18 +26,37 @@ PLIST_VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
+MIN_OS=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' Info.plist)
+ARCH=${S2G_ARCH:-$(uname -m)}
+TARGET="$ARCH-apple-macosx$MIN_OS"
 SDK_FIX="$HOME/Developer/.swift-sdk-fix"
 if [ -d "$SDK_FIX/MacOSX.sdk" ] && [ -f "$SDK_FIX/vfs.yaml" ]; then
   swiftc -sdk "$SDK_FIX/MacOSX.sdk" -vfsoverlay "$SDK_FIX/vfs.yaml" \
-    -target arm64-apple-macosx26.2 \
-    -parse-as-library -O -whole-module-optimization \
+    -target "$TARGET" -parse-as-library -O -whole-module-optimization \
     Sources/*.swift -o "$APP/Contents/MacOS/screen2gif"
 else
-  swiftc -parse-as-library -O -whole-module-optimization \
+  swiftc -target "$TARGET" -parse-as-library -O -whole-module-optimization \
     Sources/*.swift -o "$APP/Contents/MacOS/screen2gif"
 fi
 
 cp Info.plist "$APP/Contents/Info.plist"
+cp -R Resources/Fonts Resources/Lucide "$APP/Contents/Resources/"
+# Embed the complete ESM CLI, so moving the .app cannot break conversion.
+CLI="$APP/Contents/Resources/cli"
+mkdir -p "$CLI/bin" "$CLI/lib"
+cp ../bin/screen2gif "$CLI/bin/"
+cp ../lib/*.mjs "$CLI/lib/"
+cp ../package.json "$CLI/"
+chmod +x "$CLI/bin/screen2gif"
+
+ICONSET="build/AppIcon.iconset"
+mkdir -p "$ICONSET"
+for size in 16 32 128 256 512; do
+  sips -z "$size" "$size" Resources/AppIcon.png --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+  double=$((size * 2))
+  sips -z "$double" "$double" Resources/AppIcon.png --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 
 # 必须用固定身份签名而不是 ad-hoc：ad-hoc 的 designated requirement 就是 cdhash，
 # 每次重建都变，TCC 的屏幕录制授权随之失效，用户得反复去系统设置里重加。
@@ -48,5 +67,13 @@ if ! security find-identity -v -p codesigning 2>/dev/null | grep -q "$IDENTITY";
   IDENTITY="-"
 fi
 codesign --force --sign "$IDENTITY" "$APP"
+
+# Replacing files inside an existing bundle does not update its directory mtime.
+# Finder/Launch Services can otherwise keep the pre-icon application metadata.
+touch "$APP"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [ -x "$LSREGISTER" ]; then
+  "$LSREGISTER" -f "$APP" || echo "warning: 无法刷新 app 的系统登记，请重新打开 Finder 中的应用目录" >&2
+fi
 
 echo "✓ $APP"

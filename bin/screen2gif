@@ -7,12 +7,12 @@ import { join, resolve, basename, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import {
   ffmpeg, ffprobe, probe, detectCrop, normalizeCrop, extractKeyframes,
-  applyFrameCap, computeDelays, buildConcatList, encodeGif, SENSITIVITY,
+  applyFrameCap, applyFrameRate, computeDelays, buildConcatList, encodeGif, SENSITIVITY,
 } from '../lib/video.mjs';
 import { record, frontWindowRegion, checkPermission } from '../lib/record.mjs';
 import { ensureFfmpeg, binWorks, responsibleAppName, openScreenCaptureSettings } from '../lib/deps.mjs';
 
-const VERSION = '1.3.1';
+const VERSION = '1.5.0';
 
 const HELP = `screen2gif ${VERSION} — 录屏 → 关键帧 → 裁剪 → GIF
 
@@ -28,7 +28,7 @@ const HELP = `screen2gif ${VERSION} — 录屏 → 关键帧 → 裁剪 → GIF
       --no-palette        跳过调色板两遍编码 (更快，体积更大)
 
 关键帧:
-      --fps <n>           帧率上限，即最小帧间隔 1/n (默认 10)
+      --fps <n>           播放帧率上限；抽样保留最终状态 (默认 10)
       --sensitivity <档>  low | default | high，变化检测灵敏度 (默认 default)
       --max-frames <n>    关键帧上限，超出则均匀抽稀 (默认 240)
       --max-gap <秒>      单帧最长停留，长静默被截断 (默认 2.0)
@@ -62,10 +62,7 @@ const HELP = `screen2gif ${VERSION} — 录屏 → 关键帧 → 裁剪 → GIF
   -h, --help              显示帮助
   -V, --version           显示版本`;
 
-function fail(msg) {
-  process.stderr.write(`\n✗ ${msg}\n`);
-  process.exit(1);
-}
+function fail(msg) { throw new Error(msg); }
 
 function parseArgs(argv) {
   const o = {
@@ -74,7 +71,7 @@ function parseArgs(argv) {
     crop: 'auto', pad: null, duration: null, region: 'screen',
     clicks: false, display: null, interactive: false, countdown: 3, silent: false,
     then: null, readyFile: null, json: false,
-    keepMov: false, keepFrames: false,
+    keepMov: false, keepFrames: false, watermarkOverlay: null,
     verbose: false, quiet: false,
   };
   const num = (flag, v) => {
@@ -91,6 +88,8 @@ function parseArgs(argv) {
       case '-o': case '--out': o.out = next(); break;
       case '-w': case '--width': o.width = Math.max(0, Math.round(num(a, next()))); break;
       case '--no-palette': o.palette = false; break;
+      // Private app-to-CLI bridge: AppKit has already rendered text and emoji.
+      case '--watermark-overlay': o.watermarkOverlay = resolve(next()); break;
       case '--fps':
         o.fps = num(a, next());
         if (o.fps < 1 || o.fps > 60) fail('--fps 需在 1-60 之间');
@@ -103,9 +102,15 @@ function parseArgs(argv) {
         o.maxFrames = Math.round(num(a, next()));
         if (o.maxFrames < 1) fail('--max-frames 需为正整数（0 会被当成「无上限」，这里直接拒绝）');
         break;
-      case '--max-gap': o.maxGap = num(a, next()); break;
+      case '--max-gap':
+        o.maxGap = num(a, next());
+        if (o.maxGap <= 0) fail('--max-gap 需为正数');
+        break;
       case '--crop': o.crop = next(); break;
-      case '--pad': o.pad = Math.round(num(a, next())); break;
+      case '--pad':
+        o.pad = Math.round(num(a, next()));
+        if (o.pad < 0) fail('--pad 不能为负数');
+        break;
       case '-d': case '--duration':
         o.duration = num(a, next());
         if (o.duration <= 0) fail('-d 需为正数秒（0 会退化成手动模式，这里直接拒绝）');
@@ -163,7 +168,7 @@ function fmtBytes(n) {
   return `${(n / 1024 / 1024).toFixed(2)} MB`;
 }
 
-async function resolveCrop(input, src, opts, work, pattern, minInterval, log) {
+async function resolveCrop(input, src, opts, work, pattern, log) {
   if (opts.crop === 'off') { log('  裁剪 off'); return null; }
   if (opts.crop !== 'auto') {
     const crop = parseRect(opts.crop, '--crop');
@@ -179,7 +184,7 @@ async function resolveCrop(input, src, opts, work, pattern, minInterval, log) {
   const analysisWidth = Math.min(1280, src.width);
   await extractKeyframes({
     input, outDir: analysisDir, pattern, crop: null,
-    width: analysisWidth, sensitivity: opts.sensitivity, minInterval,
+    width: analysisWidth, sensitivity: opts.sensitivity,
     quiet: opts.quiet, label: '分析运动区域', verbose: opts.verbose,
   });
   const bbox = await detectCrop(analysisDir, pattern, { verbose: opts.verbose });
@@ -207,14 +212,14 @@ async function convert(input, opts) {
   const pattern = '%05d.png';
   const minInterval = 1 / opts.fps;
   try {
-    const crop = await resolveCrop(input, src, opts, work, pattern, minInterval, log);
+    const crop = await resolveCrop(input, src, opts, work, pattern, log);
     const outWidth = opts.width > 0 ? Math.min(opts.width, crop ? crop.w : src.width) : 0;
 
     const framesDir = join(work, 'frames');
     await mkdir(framesDir, { recursive: true });
     const times = await extractKeyframes({
       input, outDir: framesDir, pattern, crop, width: outWidth,
-      sensitivity: opts.sensitivity, minInterval,
+      sensitivity: opts.sensitivity,
       quiet: opts.quiet, label: '提取关键帧', verbose: opts.verbose,
     });
     const pngs = await listFrames(framesDir);
@@ -223,17 +228,23 @@ async function convert(input, opts) {
       fail(`关键帧数(${pngs.length})与时间戳数(${times.length})不一致，ffmpeg 行为异常`);
     }
 
-    const kept = applyFrameCap(times, opts.maxFrames);
+    const sampled = applyFrameRate(times, minInterval);
+    const kept = applyFrameCap(sampled, opts.maxFrames).map((i) => sampled[i]);
     if (kept.length < times.length) log(`  抽稀 ${times.length} → ${kept.length} 帧 (--max-frames ${opts.maxFrames})`);
     const frames = kept.map((i) => pngs[i]);
     const delays = computeDelays(kept.map((i) => times[i]), {
-      minGap: minInterval * 0.9, maxGap: opts.maxGap, endHold: 1.2,
+      minGap: minInterval, maxGap: opts.maxGap, endHold: 1.2,
     });
 
     const listFile = join(work, 'frames.txt');
     await buildConcatList(frames, delays, listFile);
     await encodeGif({
       listFile, out: opts.out, palette: opts.palette,
+      watermark: opts.watermarkOverlay && {
+        path: opts.watermarkOverlay,
+        imageSize: await probe(opts.watermarkOverlay),
+        frameSize: await probe(frames[0]),
+      },
       quiet: opts.quiet, label: '编码 GIF', verbose: opts.verbose,
     });
 
@@ -244,10 +255,11 @@ async function convert(input, opts) {
       for (const f of frames) await copyFile(f, join(dest, basename(f)));
       log(`  关键帧已保留 ${dest}`);
     }
-    // 供 --json 输出的成片统计
+    const encoded = await probe(opts.out);
     return {
-      frames: frames.length,
-      gifDuration: delays.reduce((s, d) => s + d, 0) / 100,
+      frames: encoded.nbFrames,
+      keyframes: frames.length,
+      gifDuration: encoded.duration,
       crop: crop ? { x: crop.x, y: crop.y, w: crop.w, h: crop.h } : null,
     };
   } finally {
@@ -285,13 +297,13 @@ async function cmdRecord(opts) {
     if (region) log(`  录制区域 ${region.w}x${region.h}+${region.x}+${region.y} (屏幕点)`);
 
     // --then 编排：真正开录（onStarted 回调）才 spawn 命令，命令退出（until
-    // 完成）即停录制。命令输出直接透传（stdio inherit）；退出码非 0 只警告，
+    // 完成）即停录制。机器输出模式下子命令 stdout 转到 stderr；退出码非 0 只警告，
     // GIF 照常产出——失败的操作过程往往正是要看的东西
     let thenExit = null;
     let launchThen = null;
     const until = opts.then ? new Promise((resolve) => {
       launchThen = () => {
-        const child = spawn('/bin/sh', ['-c', opts.then], { stdio: 'inherit' });
+        const child = spawn('/bin/sh', ['-c', opts.then], { stdio: ['inherit', opts.json || opts.quiet ? 2 : 'inherit', 'inherit'] });
         child.on('exit', (code) => { thenExit = code ?? 1; resolve(); });
         child.on('error', (e) => {
           process.stderr.write(`✗ 无法执行 --then 命令：${e.message}\n`);
@@ -394,6 +406,7 @@ async function main() {
       gif: opts.out,
       bytes: st.size,
       frames: conv?.frames ?? null,
+      keyframes: conv?.keyframes ?? null,
       gifDuration: conv?.gifDuration ?? null,
       crop: conv?.crop ?? null,
       elapsed: +((Date.now() - started) / 1000).toFixed(1),
@@ -410,5 +423,6 @@ async function main() {
 
 main().catch((err) => {
   process.stderr.write(`\r${' '.repeat(100)}\r`);
-  fail(err.message || String(err));
+  process.stderr.write(`\n✗ ${err.message || String(err)}\n`);
+  process.exitCode = 1;
 });

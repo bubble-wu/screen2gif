@@ -3,35 +3,49 @@ import AppKit
 // 全屏透明 overlay：拖拽框选录制区域，返回 CG 坐标（点，左上原点）。
 // Esc 或单击不拖拽 = 取消（返回 nil）。
 enum RegionPicker {
+  private static var activeWindow: NSWindow?
   static func pick(completion: @escaping (CGRect?) -> Void) {
     DispatchQueue.main.async {
       guard let screen = NSScreen.screens.first else {
         completion(nil)
         return
       }
-      let window = OverlayWindow(
-        contentRect: screen.frame,
-        styleMask: .borderless,
-        backing: .buffered,
-        defer: false)
-      window.level = .screenSaver
-      window.isOpaque = false
-      window.backgroundColor = .clear
-      window.hasShadow = false
-      window.ignoresMouseEvents = false
-      window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-
-      let view = SelectionView(frame: NSRect(origin: .zero, size: screen.frame.size))
-      view.onPick = { rect in
-        window.orderOut(nil)
-        completion(rect)
-      }
-      window.contentView = view
+      let window = makeWindow(frame: screen.frame, completion: completion)
       window.makeKeyAndOrderFront(nil)
-      window.makeFirstResponder(view)
+      window.makeFirstResponder(window.contentView)
       NSApp.activate(ignoringOtherApps: true)
     }
   }
+
+  /// Kept separate from showing the window so its ownership can be tested.
+  static func makeWindow(frame: CGRect, completion: @escaping (CGRect?) -> Void) -> NSWindow {
+    let window = OverlayWindow(
+      contentRect: frame,
+      styleMask: .borderless,
+      backing: .buffered,
+      defer: false)
+    window.level = .screenSaver
+    window.isOpaque = false
+    window.backgroundColor = .clear
+    window.hasShadow = false
+    window.ignoresMouseEvents = false
+    window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+
+    let view = SelectionView(frame: NSRect(origin: .zero, size: frame.size))
+    view.onPick = { [weak window, weak view] rect in
+      guard view?.onPick != nil else { return }
+      view?.onPick = nil
+      window?.orderOut(nil)
+      window?.contentView = nil
+      activeWindow = nil
+      completion(rect)
+    }
+    activeWindow = window
+    window.isReleasedWhenClosed = false
+    window.contentView = view
+    return window
+  }
+
 }
 
 // borderless 窗口默认 canBecomeKey == false，收不到键盘事件，Esc 就是死的。
@@ -54,7 +68,8 @@ private final class SelectionView: NSView {
   private func cgPoint(_ event: NSEvent) -> CGPoint {
     let p = convert(event.locationInWindow, to: nil)
     let h = window?.screen?.frame.height ?? 0
-    return CGPoint(x: p.x, y: h - p.y)
+    let w = window?.screen?.frame.width ?? 0
+    return CGPoint(x: min(max(0, p.x), w), y: min(max(0, h - p.y), h))
   }
 
   override func mouseDown(with event: NSEvent) {

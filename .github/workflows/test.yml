@@ -1,0 +1,17 @@
+name: Regression checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - run: brew install ffmpeg
+      - run: npm test
+      - run: npm run test:native
+      - run: ./native/build.sh
+      - run: codesign --verify --strict native/build/screen2gif.app

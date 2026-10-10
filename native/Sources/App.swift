@@ -17,25 +17,26 @@ final class Model: ObservableObject {
   @Published var missingDeps: [String] = []
   /// 「安装依赖」进行中：隐藏按钮 + 拦住重复点击（连点会起两个 brew）
   @Published private(set) var installing = false
-  /// 菜单里显示的输出目录（「输出位置：xxx」），选完即刷新
-  @Published private(set) var outputLabel = ""
 
   private let recorder = Recorder()
   // 圈选已经表达了取景意图，转码时跳过 auto 裁剪，所见即所得
   private var regionPicked = false
+  private var recordingSettings = AppPreferences.shared.snapshot
   /// stop() 后等 didFinish 的兜底：采集会话卡死时回调永远不来，
   /// phase 会停在 converting，菜单回不到可录制状态。自测路径有 20s 超时，正式 UI 也得有。
   private var stopWatchdog: Task<Void, Never>?
+  private var startupTask: Task<Void, Never>?
+  private var activeID: UUID?
 
   init() {
     recorder.onFinished = { [weak self] mov in
-      DispatchQueue.main.async { self?.handleRecordingFinished(mov) }
+      self?.handleRecordingFinished(mov)
     }
     recorder.onFailed = { [weak self] error in
-      DispatchQueue.main.async { self?.fail(error) }
+      self?.fail(error)
     }
 
-    // 全局快捷键（可在「快捷键设置…」里改）
+    // 全局快捷键（可在「设置…」里改）
     ShortcutStore.shared.registerAll()
     HotKeyCenter.shared.onAction = { [weak self] action in
       DispatchQueue.main.async {
@@ -51,7 +52,10 @@ final class Model: ObservableObject {
     // 启动即自检：权限/依赖的问题当场暴露在菜单里，
     // 别让用户第一次录制失败才知道还要授权、装依赖
     Task { @MainActor in
-      do { _ = try await SCShareableContent.current }
+      do {
+        let content = try await captureWithDeadline(seconds: 60) { try await SCShareableContent.current }
+        if content.displays.isEmpty { needsPermission = true; statusLine = "缺少屏幕录制权限" }
+      }
       catch {
         if Self.isPermissionError(error) {
           needsPermission = true
@@ -60,33 +64,6 @@ final class Model: ObservableObject {
       }
     }
     missingDeps = Deps.missing()
-    outputLabel = Self.describeOutputDirectory(Converter.outputDirectory())
-  }
-
-  /// 菜单里的「输出位置…」：目录选择面板，存 UserDefaults，下次录制即生效。
-  /// 面板里能新建目录；选到的目录就算之后被删，CLI 也会 -o mkdir 自动重建
-  func chooseOutputDirectory() {
-    let panel = NSOpenPanel()
-    panel.canChooseDirectories = true
-    panel.canChooseFiles = false
-    panel.canCreateDirectories = true
-    panel.directoryURL = Converter.outputDirectory()
-    panel.message = "录制的 GIF 保存到这里"
-    if panel.runModal() == .OK, let url = panel.url {
-      UserDefaults.standard.set(url.path, forKey: Converter.outputDirKey)
-      outputLabel = Self.describeOutputDirectory(url)
-    }
-  }
-
-  /// 目录的菜单显示：桌面写「桌面」，home 下缩成 ~/…，其余显示完整路径
-  private static func describeOutputDirectory(_ url: URL) -> String {
-    let fm = FileManager.default
-    if let desktop = fm.urls(for: .desktopDirectory, in: .userDomainMask).first,
-       url.path == desktop.path { return "桌面" }
-    let home = fm.homeDirectoryForCurrentUser.path
-    if url.path == home { return "~" }
-    if url.path.hasPrefix(home + "/") { return "~" + url.path.dropFirst(home.count) }
-    return url.path
   }
 
   /// 菜单里的「安装缺失依赖」：跑 brew install（进度不透传，只留报错尾巴），
@@ -163,15 +140,27 @@ final class Model: ObservableObject {
   }
 
   func stop() {
+    if phase == .starting {
+      activeID = nil
+      startupTask?.cancel()
+      startupTask = nil
+      recorder.abort()
+      RecordingOverlay.hide()
+      phase = .idle
+      statusLine = "已取消开始录制"
+      return
+    }
     guard phase == .recording else { return }
     phase = .converting
     statusLine = "收尾中…"
     recorder.stop()
+    RecordingOverlay.hide()
     // 兜底：stopCapture 后 didFinish 正常百毫秒级就来，30 秒还没到就是会话卡死。
     // 转码阶段不设超时——时长随录制时长增长，固定值会误杀长录制。
+    let id = activeID
     stopWatchdog = Task { @MainActor in
       try? await Task.sleep(nanoseconds: 30_000_000_000)
-      guard !Task.isCancelled else { return }
+      guard !Task.isCancelled, self.activeID == id else { return }
       self.fail(StopTimeout())
     }
   }
@@ -179,56 +168,59 @@ final class Model: ObservableObject {
   private func start(region: CGRect?) {
     let mov = FileManager.default.temporaryDirectory
       .appendingPathComponent("s2g-\(UUID().uuidString).mov")
-    // 先把 overlay 挂出来：Recorder 要拿它的窗口从采集里剔除（全屏时不这么做会入镜）
+    let id = UUID()
+    activeID = id
+    phase = .starting
+    statusLine = "准备录制中…"
+    regionPicked = (region != nil)
+    recordingSettings = AppPreferences.shared.snapshot
+    let focused = CaptureResult<Void>()
+    if region == nil { focused.resolve(.success(())) }
     let overlayWindows = RecordingOverlay.show(
       region: region,
       onStop: { [weak self] in self?.stop() },
-      // 框选：对焦动画完成（画面清晰）时播 Glass——「清晰了 = 开始了」
-      onFocused: { [weak self] in
-        guard let self, self.phase == .starting || self.phase == .recording else { return }
-        Self.cue("Glass")
-      })
-    // Recorder.start 已是 async：主线程不再被 SCShareableContent 查询/
-    // startCapture 阻塞，对焦快照的 Task 与开录并行推进，提示音不再漂移
-    phase = .starting
-    statusLine = ""
-    Task { @MainActor in
+      onFocused: { focused.resolve(.success(())) })
+    let excludedIDs = overlayWindows.map(\.windowNumber)
+    startupTask = Task { @MainActor in
       do {
-        // windowNumber 在 MainActor 上取好再传进去：Recorder.start 是 nonisolated
-        // async，直接摸 NSWindow 会撞并发检查
-        let excludedIDs = overlayWindows.map(\.windowNumber)
         try await recorder.start(region: region, to: mov, excluding: excludedIDs)
-        regionPicked = (region != nil)
+        let startedAt = Date()
+        // Both the writer and focus animation must be ready before the cue.
+        try await captureWithDeadline(seconds: 2) { try await focused.value() }
+        guard !Task.isCancelled, activeID == id, phase == .starting else { return }
         phase = .recording
+        startupTask = nil
         needsPermission = false
-        if region == nil {
-          Self.cue("Glass")
-        }
+        RecordingOverlay.markRecording(startedAt: startedAt)
+        cue("Glass")
       } catch {
-        RecordingOverlay.hide()
+        guard activeID == id else { return }
         fail(error)
       }
     }
   }
 
   private func handleRecordingFinished(_ mov: URL) {
+    guard let id = activeID, phase == .recording || phase == .converting else { return }
     stopWatchdog?.cancel()
     stopWatchdog = nil
     RecordingOverlay.hide()
-    Self.cue("Tink")
+    cue("Tink")
     phase = .converting
     statusLine = "转码中…"
     dbg("recording finished: \(mov.path)")
-    Converter.convert(mov: mov, regionPicked: regionPicked) { [weak self] result in
+    let settings = recordingSettings
+    Converter.convert(mov: mov, regionPicked: regionPicked, settings: settings) { [weak self] result in
       DispatchQueue.main.async {
-        guard let self else { return }
+        guard let self, self.activeID == id else { return }
         switch result {
         case .success(let gif):
           dbg("converted: \(gif.path)")
           try? FileManager.default.removeItem(at: mov)
+          self.activeID = nil
           self.phase = .idle
           self.statusLine = "已保存 \(gif.lastPathComponent)"
-          NSWorkspace.shared.activateFileViewerSelecting([gif])
+          if settings.revealAfterExport { NSWorkspace.shared.activateFileViewerSelecting([gif]) }
         case .failure(let error):
           self.fail(error)
         }
@@ -238,6 +230,10 @@ final class Model: ObservableObject {
 
   private func fail(_ error: Error) {
     dbg("fail: \(error.localizedDescription)")
+    activeID = nil
+    startupTask?.cancel()
+    startupTask = nil
+    recorder.abort()
     stopWatchdog?.cancel()
     stopWatchdog = nil
     RecordingOverlay.hide()
@@ -247,12 +243,20 @@ final class Model: ObservableObject {
   }
 
   // 与 CLI 一致的提示音：开始 Glass，结束 Tink
-  private static func cue(_ name: String) {
+  private func cue(_ name: String) {
+    guard recordingSettings.playSounds else { return }
     NSSound(contentsOf: URL(fileURLWithPath: "/System/Library/Sounds/\(name).aiff"), byReference: true)?.play()
   }
 
   // 未授权屏幕录制时 SCShareableContent 直接抛错，得把用户领到设置面板
   private static func isPermissionError(_ error: Error) -> Bool {
+    if let wrapped = error as? Recorder.RecorderError {
+      switch wrapped {
+      case .noDisplay: return true
+      case .queryContentFailed(let inner), .startFailed(let inner), .addOutputFailed(let inner):
+        return isPermissionError(inner)
+      }
+    }
     let ns = error as NSError
     if ns.domain == "SCStreamErrorDomain", ns.code == -3801 { return true }
     let text = ns.localizedDescription
@@ -291,20 +295,21 @@ struct MenuContent: View {
         }
       }
       if !shortcuts.conflicts.isEmpty {
-        Text("⚠ 有快捷键注册失败（可能被其他应用占用），可在「快捷键设置…」更换")
+        Text("⚠ 有快捷键注册失败（可能被其他应用占用），可在「设置…」更换")
       }
       Divider()
       Button("录制全屏\(hint(.fullscreen))") { model.startFullscreen() }
       Button("框选区域录制…\(hint(.region))") { model.startRegion() }
       Divider()
-      Button("输出位置：\(model.outputLabel)…") { model.chooseOutputDirectory() }
-      Button("快捷键设置…") { SettingsWindowController.shared.open() }
+      Button("打开 GIF 存储目录") { OutputDirectory.open() }
+      Button("设置…") { SettingsWindowController.shared.open() }
       Divider()
       Button("退出") { NSApplication.shared.terminate(nil) }
     case .picking:
       Text("在屏幕上拖拽框选…（Esc 取消）")
     case .starting:
-      Text("正在开始录制…")
+      Text("准备录制中…")
+      Button("取消") { model.stop() }
     case .recording:
       Text("● 录制中 · 状态条可直接停止")
       Button("停止录制并转码\(hint(.stop))") { model.stop() }
@@ -341,8 +346,26 @@ final class OutputTail: @unchecked Sendable {
   }
 }
 
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+  func applicationDidFinishLaunching(_ notification: Notification) {
+    LaunchAtLogin.shared.start()
+    if CommandLine.arguments.contains("--settings") { SettingsWindowController.shared.open() }
+  }
+
+  func applicationDidBecomeActive(_ notification: Notification) {
+    LaunchAtLogin.shared.refresh()
+  }
+
+  func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+    SettingsWindowController.shared.open()
+    return true
+  }
+}
+
 @main
 struct Screen2GifApp: App {
+  @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
   @StateObject private var model = Model()
 
   init() {
@@ -360,7 +383,8 @@ struct Screen2GifApp: App {
     MenuBarExtra {
       MenuContent().environmentObject(model)
     } label: {
-      Image(systemName: model.phase == .recording ? "record.circle.fill" : "record.circle")
+      Image(nsImage: CaptureIcon.menuBar(recording: model.phase == .recording))
+        .accessibilityLabel("screen2gif")
     }
   }
 
@@ -405,45 +429,31 @@ struct Screen2GifApp: App {
   }
 
   private static func runSelfTest(seconds: Double, region: CGRect?) {
+    var finished = false
+    var exitStatus: Int32 = 1
     let recorder = Recorder()
-    let done = DispatchSemaphore(value: 0)
-    var result: Result<URL, Error>?
-    recorder.onFinished = { url in result = .success(url); done.signal() }
-    recorder.onFailed = { error in result = .failure(error); done.signal() }
-
+    let result = CaptureResult<URL>()
+    recorder.onFinished = { result.resolve(.success($0)) }
+    recorder.onFailed = { result.resolve(.failure($0)) }
     let mov = FileManager.default.temporaryDirectory
-      .appendingPathComponent("s2g-selftest.mov")
-    // start 已是 async；自测在 runloop 之外跑，用信号量桥回同步。
-    // 必须 Task.detached：这里处于 @MainActor 的 App.init，普通 Task 会
-    // 继承 MainActor 排进主队列，而主线程正阻塞在下面的 wait() 上——死锁。
-    let startSem = DispatchSemaphore(value: 0)
-    var startError: Error?
-    Task.detached {
-      do { try await recorder.start(region: region, to: mov) }
-      catch { startError = error }
-      startSem.signal()
+      .appendingPathComponent("s2g-selftest-\(UUID().uuidString).mov")
+    Task { @MainActor in
+      defer { finished = true }
+      do {
+        try await recorder.start(region: region, to: mov)
+        dbg("recording \(seconds)s")
+        try await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+        recorder.stop()
+        let url = try await captureWithDeadline(seconds: 30) { try await result.value() }
+        print("MOV \(url.path)")
+        exitStatus = 0
+      } catch {
+        recorder.abort()
+        dbg("ERROR: \(error.localizedDescription)")
+      }
     }
-    startSem.wait()
-    if let startError {
-      FileHandle.standardError.write("ERROR: \(startError.localizedDescription)\n".data(using: .utf8)!)
-      exit(1)
-    }
-    FileHandle.standardError.write("recording \(seconds)s\n".data(using: .utf8)!)
-    Thread.sleep(forTimeInterval: seconds)
-    recorder.stop()
-    guard done.wait(timeout: .now() + 20) != .timedOut else {
-      FileHandle.standardError.write("ERROR: 收尾超时\n".data(using: .utf8)!)
-      exit(1)
-    }
-    switch result {
-    case .success(let url):
-      print("MOV \(url.path)")
-    case .failure(let error):
-      FileHandle.standardError.write("ERROR: \(error.localizedDescription)\n".data(using: .utf8)!)
-      exit(1)
-    case nil:
-      FileHandle.standardError.write("ERROR: 无结果\n".data(using: .utf8)!)
-      exit(1)
-    }
+    // SDK delegates and session state run on MainActor; keep its run loop alive.
+    while !finished { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
+    exit(exitStatus)
   }
 }
