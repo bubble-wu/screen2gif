@@ -6,16 +6,53 @@
 
 ## 下载与首次打开
 
-[直接下载 v1.5.0](https://github.com/bubble-wu/screen2gif/releases/download/v1.5.0/screen2gif-v1.5.0-macOS.zip)（约 13 MB）· [所有版本](https://github.com/bubble-wu/screen2gif/releases)
+[下载 DMG · v1.5.0](https://github.com/bubble-wu/screen2gif/releases/download/v1.5.0/screen2gif-v1.5.0-macOS-arm64.dmg) · [备用 ZIP](https://github.com/bubble-wu/screen2gif/releases/download/v1.5.0/screen2gif-v1.5.0-macOS.zip)· [所有版本](https://github.com/bubble-wu/screen2gif/releases)
 
 预编译包适用于 **macOS 15+、Apple Silicon（M1 及更新芯片）**。Intel Mac 请参考[从源码构建](development.md)。App 已内置转码 CLI，移动 App 不依赖仓库位置；Node.js ≥ 18 和 ffmpeg / ffprobe 仍需另行安装。
 
-1. 解压 ZIP，把 `screen2gif.app` 拖入「应用程序」，再打开。
-2. 如果系统提示无法验证开发者，先尝试打开一次，再进入「系统设置 → 隐私与安全性」，点击「仍要打开」，确认打开。当前包使用自签名证书，首次打开操作参见 [Apple 官方说明](https://support.apple.com/zh-cn/102445)。
+1. 双击 DMG，把 `screen2gif.app` 拖到 `Applications`。复制完成后在访达侧栏推出 `screen2gif` 磁盘，再从「应用程序」打开 App；不要直接运行磁盘里的副本。备用 ZIP 则解压后把 App 拖入「应用程序」。
+2. 当前包使用自签名证书，尚未使用 Apple Developer ID 签名和公证。若提示「Apple 无法验证是否包含恶意软件」或「无法验证开发者」，按下面的[安全提示排查](#安全提示排查)处理。
 3. 菜单提示「安装缺失依赖…」时，点击安装（需要已有 [Homebrew](https://brew.sh)）；也可以自行在终端执行 `brew install node ffmpeg`。
 4. 在「系统设置 → 隐私与安全性 → 屏幕与系统录音」中启用 `screen2gif`；列表没有时点 `+`，选择「应用程序」中的 `screen2gif.app`。授权后退出并重新打开 App。
 
 权限归属这个 App；CLI 的权限则归属运行命令的终端，两者需要分别授权。
+
+## 安全提示排查
+
+「移到废纸篓」按钮会出现在多种安全提示中，需要看提示正文判断；不能仅凭这个按钮认定原因。
+
+### Apple 无法验证是否包含恶意软件／无法验证开发者
+
+当前发行版尚未经过 Apple 公证，可能出现：
+
+> Apple 无法验证“screen2gif”是否包含可能危害 Mac 安全或泄漏隐私的恶意软件。
+
+确认来自本仓库的 [GitHub Releases](https://github.com/bubble-wu/screen2gif/releases) 后：
+
+1. 在提示里选择「完成」或「取消」，保留已复制到「应用程序」的 App。
+2. 打开「系统设置 → 隐私与安全性」，向下找到阻止 `screen2gif` 打开的提示。
+3. 点击「仍要打开」，按系统要求验证，再在确认框里点击「打开」。
+4. 之后仍需单独授予屏幕录制权限；允许启动不代表已经授权录屏。
+
+如果看不到「仍要打开」，重新尝试打开 `/Applications/screen2gif.app`，再回到系统设置；受组织管理的 Mac 可能限制此选项，需要联系管理员。上述步骤依据 [Apple 官方说明](https://support.apple.com/zh-cn/102445)。
+
+DMG 只提供拖拽安装界面，不会自动完成 Apple 公证、安装 Node.js / ffmpeg 或授予屏幕录制权限。
+
+### App 已损坏，无法打开
+
+先从 Releases 重新下载，再对照同一版本的 `SHA256SUMS.txt` 校验下载文件；不一致时不要继续安装。DMG 还可以检查镜像完整性：
+
+```sh
+shasum -a 256 ~/Downloads/screen2gif-v1.5.0-macOS-arm64.dmg
+hdiutil verify ~/Downloads/screen2gif-v1.5.0-macOS-arm64.dmg
+codesign --verify --strict /Applications/screen2gif.app
+```
+
+SHA-256 应与 [v1.5.0 校验文件](https://github.com/bubble-wu/screen2gif/releases/download/v1.5.0/SHA256SUMS.txt) 中对应文件名的值一致。镜像与代码签名校验能发现下载或复制损坏，不等于 Apple 已确认软件没有恶意内容。校验失败时重新下载与复制；仍失败请在 [Issues](https://github.com/bubble-wu/screen2gif/issues) 附上系统版本、提示原文和校验结果。
+
+### 会损坏你的电脑／包含恶意软件
+
+停止打开并联系维护者。这个提示可能涉及恶意内容或撤销的授权，不能套用未公证 App 的首次打开流程；按 [Apple 官方说明](https://support.apple.com/zh-cn/102445) 处理。不要关闭整个系统的 Gatekeeper，也不要对这类提示使用清除隔离属性的命令。
 
 ## 录制与导出
 
